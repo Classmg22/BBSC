@@ -8398,11 +8398,19 @@ bool BbscApplyDeathPenalty(std::string_view why) {
                      why, earned_while_dead, before);
         }
     }
+    // The record's map and spot (+0x3C, +0x18), so a test shows where the stain went.
+    const bool record_ok = ReadablePointer(record, 0x40);
+    const u32 stain_map = record_ok ? ReadValue<u32>(record, 0x3C) : 0;
+    const float stain_x = record_ok ? ReadValue<float>(record, 0x18) : 0.0f;
+    const float stain_y = record_ok ? ReadValue<float>(record, 0x1C) : 0.0f;
+    const float stain_z = record_ok ? ReadValue<float>(record, 0x20) : 0.0f;
     LOG_INFO(Debug,
-             "BBSC death penalty ({}): dropped {} echoes (now {}, stain holds {}, type {}, gate {})",
-             why, before, GetBloodEchoes(), in_stain, GetLocalPlayerType(), gate);
-    BBSC_TIMELINE("DEATH", "death penalty ({}): dropped {} echoes (now {}, stain holds {}, type {}, gate {})",
-             why, before, GetBloodEchoes(), in_stain, GetLocalPlayerType(), gate);
+             "BBSC death penalty ({}): dropped {} echoes (now {}, stain holds {} in map {:#x} at "
+             "({:.1f}, {:.1f}, {:.1f}), type {}, gate {})",
+             why, before, GetBloodEchoes(), in_stain, stain_map, stain_x, stain_y, stain_z,
+             GetLocalPlayerType(), gate);
+    BBSC_TIMELINE("DEATH", "death penalty ({}): dropped {} echoes (now {}, stain holds {} in map {:#x}, type {}, gate {})",
+             why, before, GetBloodEchoes(), in_stain, stain_map, GetLocalPlayerType(), gate);
     return true;
 }
 
@@ -8548,6 +8556,7 @@ void TickBbscSpectate() {
         bbsc_spectate_saw_wipe = true;
         LOG_INFO(Debug, "BBSC spectate: a partner said dead and then alive while we were down - "
                         "it reloaded after a wipe, the guest follows");
+        BbscApplyDeathPenalty("wipe, before our reload"); // see "nobody alive" below
     }
     if (session_alive && LivingPartnerExists()) {
         std::string_view respawn_why;
@@ -8651,6 +8660,11 @@ void TickBbscSpectate() {
                 LOG_INFO(Debug, "BBSC spectate: nobody alive - guest waits for the host's reload "
                                 "(up to {} s) instead of reloading itself",
                          BbscGuestWaitHostMs / 1'000);
+                // The echoes go into the stain now, while our body still lies where it fell.
+                // Dropped after the host's reload, they went on the new character, which has no
+                // map yet: the stain went to map 0xffffffff at a Hunter's Dream spot and never
+                // showed (2026-10-25 01:22, the guest lost 108932 echoes that way).
+                BbscApplyDeathPenalty("wipe, before the host's reload");
             }
             return;
         }
