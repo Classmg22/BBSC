@@ -13536,7 +13536,20 @@ void TickBbscDeadWatchdog() {
                         "normal reload, so the guests can follow it");
         bbsc_spectate_active = false;
         BbscApplyDeathPenalty("wipe");
-        RequestBbscDeathReload("host's repeat death in a wipe");
+        // A repeat death gets no death step, and the reload alone went where the last death step
+        // had pointed it, with the host still dead (2026-10-25 00:44: the host had rested at a new
+        // lamp since, the reload placed it at an old spot, it died again 5 s later, and the game's
+        // own death step then reloaded it at the new lamp - a double death). So the step runs
+        // here as the game runs it: SoloPlayDeath_2 (0x01381DE0, the Lua event object in rdi)
+        // picks the respawn point again and sets the load up as a death's, and
+        // BbscSpectateDeathHook asks for its reload (no living partner).
+        if (const u64 lua_event = BbscLuaEventObject(); lua_event != 0) {
+            using DeathStep = void PS4_SYSV_ABI (*)(u64 event_object);
+            reinterpret_cast<DeathStep>(image_base + SoloPlayDeathFinalOffset)(lua_event);
+            LOG_INFO(Debug, "BBSC death: the death step run for the host's repeat death");
+        } else {
+            RequestBbscDeathReload("host's repeat death in a wipe, no Lua event object");
+        }
         bbsc_wipe_reload_ms = now;
         return;
     }
