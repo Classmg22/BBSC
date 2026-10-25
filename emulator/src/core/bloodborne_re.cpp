@@ -14946,10 +14946,14 @@ bool BbscHomeSettled(s64 now, s64& since_ms) {
 constexpr u32 BbscGearWeaponTag = 0x90000000u;
 constexpr u32 BbscGearRuneTag = 0xA0000000u;
 constexpr u32 BbscGearArmorTag = 0xB0000000u;
+// Blood Gems (2026-10-25, the user: "add blood gems"): the GemGenParam rows that are not runes,
+// sent as 0xD0000000 | id (an older peer drops them) and given like the runes.
+constexpr u32 BbscGearGemTag = 0xD0000000u;
 
 bool BbscIsGearTag(u32 tagged) {
     const u32 tag = tagged & 0xF0000000u;
-    return tag == BbscGearWeaponTag || tag == BbscGearRuneTag || tag == BbscGearArmorTag;
+    return tag == BbscGearWeaponTag || tag == BbscGearRuneTag || tag == BbscGearArmorTag ||
+           tag == BbscGearGemTag;
 }
 constexpr s32 BbscGearLot = 15000;
 constexpr size_t BbscItemLotRowSize = 0x94;
@@ -15006,8 +15010,8 @@ std::vector<u32> BbscHeldGearTagged() {
             u32 tagged = 0;
             if ((code >> 28) == 0x0 && id >= 1000000) { // below: the unarmed rows
                 tagged = BbscGearWeaponTag | id;
-            } else if ((code >> 28) == 0x8 && BbscGemIsRune(id)) {
-                tagged = BbscGearRuneTag | id;
+            } else if ((code >> 28) == 0x8) {
+                tagged = (BbscGemIsRune(id) ? BbscGearRuneTag : BbscGearGemTag) | id;
             } else if ((code >> 28) == 0x1 && BbscArmorIsReal(id)) {
                 tagged = BbscGearArmorTag | id;
             }
@@ -15025,7 +15029,8 @@ bool BbscHasGear(u32 tagged) {
     const u32 id = tagged & 0x0FFFFFFFu;
     for (const u64 inventory : {BbscCarriedInventory(), BbscStorageInventory()}) {
         for (const u32 code : BbscInventoryCodes(inventory)) {
-            if ((tagged & 0xF0000000u) == BbscGearRuneTag) {
+            if ((tagged & 0xF0000000u) == BbscGearRuneTag ||
+                (tagged & 0xF0000000u) == BbscGearGemTag) {
                 if (code == (0x80000000u | id)) {
                     return true;
                 }
@@ -15134,6 +15139,95 @@ s32 GiveBbscCommunionGoods(const std::vector<u32>& tagged, std::string_view from
     return total;
 }
 
+// A weapon given at a higher level replaces the lower copies we hold (2026-10-25, the user: "if you
+// already have a +8 and receive a +10, it should replace it"). A copy is taken out only when that is
+// safe: not worn, and no Blood Gem in it. Worn: its weapon id (level included) is somewhere in the
+// player's game data [[0x0553B130]+8] outside the inventory, where the equipment is expected to keep
+// the ids of what is worn (HYPOTHESIS; the log names the offsets found). Gems: a gem handle
+// 0xC080xxxx in the copy's record, which 0x01A89070 resolves from the slot's key as the inventory
+// add 0x014DA0A0 does ({key, record, code}; the record is released through its vtable +0x10).
+// Otherwise both copies stay and the log says why.
+size_t ReplaceBbscLowerWeapons(u32 id) {
+    const u32 level = (id / 100) % 100;
+    const u32 base = id - level * 100;
+    const u64 holder = ReadValue<u64>(image_base + PlayerSlotManagerPointerOffset, 0);
+    const u64 data = ReadablePointer(holder, 0x10) ? ReadValue<u64>(holder, 0x08) : 0;
+    const u64 carried = BbscCarriedInventory();
+    size_t replaced = 0;
+    for (const u64 inventory : {carried, BbscStorageInventory()}) {
+        if (inventory == 0) {
+            continue;
+        }
+        for (const u32 code : BbscInventoryCodes(inventory)) {
+            const u32 have_level = (code / 100) % 100;
+            if ((code >> 28) != 0x0 || code < 1000000 || code - have_level * 100 != base ||
+                have_level >= level) {
+                continue;
+            }
+            std::string worn;
+            if (inventory == carried && data != 0) {
+                for (u64 at = 0; at + 4 <= 0xC00 && ReadablePointer(data + at, 4); at += 4) {
+                    if (at >= 0x328 && at < 0x328 + 0x90) {
+                        continue; // the inventory's own header
+                    }
+                    if (ReadValue<u32>(data, at) == code) {
+                        worn += fmt::format(" +{:#x}", at);
+                    }
+                }
+            }
+            bool gems = false;
+            std::string record_head;
+            const s32 slot = BbscInventorySlot(inventory, code);
+            const u64 entry = slot >= 0 ? BbscInventorySlotEntry(inventory, static_cast<u32>(slot)) : 0;
+            if (entry != 0) {
+                struct alignas(16) Resolved {
+                    u32 key;
+                    u32 pad;
+                    u64 record;
+                    u32 code;
+                    u32 pad2;
+                };
+                alignas(16) static Resolved resolved{};
+                resolved = {ReadValue<u32>(entry, 0), 0, 0, 0xFFFFFFFFu, 0};
+                using Resolve = void PS4_SYSV_ABI (*)(Resolved* item);
+                reinterpret_cast<Resolve>(image_base + 0x01A89070)(&resolved);
+                const u64 record = resolved.record;
+                if (ReadablePointer(record, 0x100)) {
+                    for (u64 at = 0; at < 0x100; at += 4) {
+                        const u32 value = ReadValue<u32>(record, at);
+                        gems = gems || (value & 0xFFFF0000u) == 0xC0800000u;
+                        if (at < 0x40) {
+                            record_head += fmt::format(" {:08x}", value);
+                        }
+                    }
+                }
+                if (ReadablePointer(record, 8)) {
+                    const u64 vtable = ReadValue<u64>(record, 0);
+                    if (ReadablePointer(vtable, 0x18) && IsEbootCodeAddress(ReadValue<u64>(vtable, 0x10))) {
+                        using Release = void PS4_SYSV_ABI (*)(u64 object);
+                        reinterpret_cast<Release>(ReadValue<u64>(vtable, 0x10))(record);
+                    }
+                }
+            }
+            if (!worn.empty() || gems || entry == 0) {
+                LOG_INFO(Debug, "BBSC communion bell: weapon {} kept beside the new {} ({}; record{})",
+                         code, id,
+                         entry == 0 ? "slot not found"
+                         : !worn.empty() ? fmt::format("worn: its id at{}", worn)
+                                         : std::string("a Blood Gem is in it"),
+                         record_head);
+                continue;
+            }
+            const bool gone = BbscInventoryRemove(inventory, code);
+            replaced += gone ? 1 : 0;
+            LOG_INFO(Debug, "BBSC communion bell: weapon {} {} by the new {} ({}; record{})", code,
+                     gone ? "replaced" : "NOT taken out", id,
+                     inventory == carried ? "carried" : "in storage", record_head);
+        }
+    }
+    return replaced;
+}
+
 struct BbscGearGifts {
     std::vector<u32> queue;
     std::vector<u32> awarded;
@@ -15142,6 +15236,8 @@ struct BbscGearGifts {
     size_t weapons = 0;
     size_t armor = 0;
     size_t runes = 0;
+    size_t gems = 0;
+    size_t replaced = 0;
     const char* from = "the host's world";
 };
 BbscGearGifts bbsc_gear_gifts;
@@ -15207,21 +15303,24 @@ void TickBbscGearGifts() {
         g.weapons = 0;
         g.armor = 0;
         g.runes = 0;
+        g.gems = 0;
         for (const u32 tagged : g.awarded) {
             if (BbscHasGear(tagged)) {
                 const u32 tag = tagged & 0xF0000000u;
                 (tag == BbscGearRuneTag    ? g.runes
+                 : tag == BbscGearGemTag   ? g.gems
                  : tag == BbscGearArmorTag ? g.armor
                                            : g.weapons) += 1;
             }
         }
-        LOG_INFO(Debug, "BBSC communion bell: gave {} weapon(s), {} armour and {} rune(s) of {}; "
-                        "lot {} put back",
-                 g.weapons, g.armor, g.runes, g.awarded.size(), BbscGearLot);
+        LOG_INFO(Debug, "BBSC communion bell: gave {} weapon(s) ({} replacing a lower copy), {} "
+                        "armour, {} rune(s) and {} Blood Gem(s) of {}; lot {} put back",
+                 g.weapons, g.replaced, g.armor, g.runes, g.gems, g.awarded.size(), BbscGearLot);
+        g.replaced = 0;
         static std::u16string text;
-        const std::string line = fmt::format("Communion: {} weapon(s), {} armor, {} rune(s)\n"
-                                             "from {} received.",
-                                             g.weapons, g.armor, g.runes, g.from);
+        const std::string line = fmt::format("Communion: {} weapon(s), {} armor, {} rune(s),\n"
+                                             "{} gem(s) from {} received.",
+                                             g.weapons, g.armor, g.runes, g.gems, g.from);
         text.assign(line.begin(), line.end());
         BbscAnnounce(text.c_str(), "communion gear received");
         return;
@@ -15245,6 +15344,7 @@ void TickBbscGearGifts() {
     const u32 tagged = g.queue.front();
     g.queue.erase(g.queue.begin());
     const bool rune = (tagged & 0xF0000000u) == BbscGearRuneTag;
+    const bool gem = (tagged & 0xF0000000u) == BbscGearGemTag;
     const bool armor = (tagged & 0xF0000000u) == BbscGearArmorTag;
     const u32 id = tagged & 0x0FFFFFFFu;
     for (const auto& [row, bytes] : g.saved_rows) {
@@ -15253,7 +15353,7 @@ void TickBbscGearGifts() {
         // lotItemCategory01: 8 a gem, 0 a weapon (ItemLotParam: lot 29000 gives weapon 18100000 as
         // category 0; 1 gave nothing, 2026-10-21 22:48: 0 of 4 weapons arrived, 6 of 6 runes did),
         // 1 armour (lot 21000: armour 190000).
-        WriteValue<s32>(row, 0x20, rune ? 8 : armor ? 1 : 0);
+        WriteValue<s32>(row, 0x20, rune || gem ? 8 : armor ? 1 : 0);
         WriteValue<u16>(row, 0x40, 100);                     // lotItemBasePoint01
         WriteValue<s32>(row, 0x60, -1);                      // getItemFlagId01
         WriteValue<s32>(row, 0x80, -1);                      // getItemFlagId
@@ -15270,10 +15370,14 @@ void TickBbscGearGifts() {
     const bool there = BbscHasGear(tagged);
     LOG_INFO(Debug, "BBSC communion bell: {} {} {}",
              rune    ? "rune"
+             : gem   ? "Blood Gem"
              : armor ? "armour"
                      : "weapon",
              id,
              there ? "received" : "not there after the award (checked again at the end)");
+    if (there && (tagged & 0xF0000000u) == BbscGearWeaponTag) {
+        g.replaced += ReplaceBbscLowerWeapons(id);
+    }
     g.next_ms = now + 1'500;
 }
 
