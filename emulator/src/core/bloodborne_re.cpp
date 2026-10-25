@@ -15050,6 +15050,90 @@ bool BbscHasGear(u32 tagged) {
     return false;
 }
 
+// ---- Supplies (2026-10-25, the user: add the Blood Stones that fortify weapons, "same with Fire
+// Paper, Bolt Paper, etc") -------------------------------------------------------------------------
+// Every stackable consumable of EquipParamGoods (goodsType 0, maxNum above 1) and the four Blood
+// Stones (goodsType 2), read off the game's param with tools/gamedata/param.py. The other side's
+// whole count, carried and stored, is added (the user's choice: not topped up to it). Sent as
+// 0xC0000000 | id << 12 | count, both below 4096; an older peer drops it like any id that is not a
+// key item. What does not fit in the carried items goes to the storage box, through the same fit
+// check and add as the kit's items.
+constexpr u32 BbscGearGoodsTag = 0xC0000000u;
+constexpr std::array<u32, 46> BbscCommunionGoods{{
+    704,  900,  1000, 1100, 1101, 1110, 1120, 1200, 1201, 1210, // Blood Dreg .. Poison Knife
+    1220, 1230, 1240, 1250, 1251, 1260, 1270, 1300, 1320, 1330, // Oil Urn .. Bone Marrow Ash
+    1400, 1410, 1500, 1501, 1510, 1511, 1512, 1513, 1514, 1515, // Bold Hunter's Mark .. Coldblood
+    1516, 1517, 1518, 1519, 1590, 1591, 1592, 1593, 1594, 1700, // Coldblood .. Vermin
+    2030, 2090, 3000, 3010, 3020, 3030,                         // Lead Elixir, Shaman Bone Blade,
+}};                                                             // the Blood Stones
+
+// Ours, tagged: every supply we hold, carried and stored together.
+std::vector<u32> BbscHeldGoodsTagged() {
+    const u64 carried = BbscCarriedInventory();
+    const u64 storage = BbscStorageInventory();
+    std::vector<u32> goods;
+    for (const u32 id : BbscCommunionGoods) {
+        const u32 code = 0x40000000u | id;
+        const s32 count = (carried != 0 ? BbscInventoryCount(carried, code) : 0) +
+                          (storage != 0 ? BbscInventoryCount(storage, code) : 0);
+        if (count > 0) {
+            goods.push_back(BbscGearGoodsTag | (id << 12) | static_cast<u32>(std::min(count, 0xFFF)));
+        }
+    }
+    return goods;
+}
+
+// Adds the supplies of a chalice's answer: into the carried items as far as they fit, the rest
+// into the storage box. Returns how many arrived in all.
+s32 GiveBbscCommunionGoods(const std::vector<u32>& tagged, std::string_view from) {
+    const u64 carried = BbscCarriedInventory();
+    const u64 storage = BbscStorageInventory();
+    if (carried == 0) {
+        return 0;
+    }
+    using Fits = s32 PS4_SYSV_ABI (*)(u64 inventory, const u32* code, s32 count);
+    using Add = s32 PS4_SYSV_ABI (*)(u64 inventory, const u32* key, s32 count);
+    alignas(16) static u32 code = 0;
+    alignas(16) static u32 key = 0;
+    s32 total = 0;
+    std::string summary;
+    for (const u32 value : tagged) {
+        if ((value & 0xF0000000u) != BbscGearGoodsTag) {
+            continue;
+        }
+        const u32 id = (value >> 12) & 0xFFF;
+        const s32 count = static_cast<s32>(value & 0xFFF);
+        if (count <= 0 || std::ranges::find(BbscCommunionGoods, id) == BbscCommunionGoods.end()) {
+            continue; // only the supplies, whatever the packet says
+        }
+        code = 0x40000000u | id;
+        key = 0x80000000u | (3u << 28) | id;
+        s32 arrived = 0;
+        s32 stored = 0;
+        for (const u64 inventory : {carried, storage}) {
+            const s32 want = count - arrived - stored;
+            if (inventory == 0 || want <= 0) {
+                continue;
+            }
+            const s32 before = BbscInventoryCount(inventory, code);
+            const s32 fits = reinterpret_cast<Fits>(image_base + InventoryFitsOffset)(inventory,
+                                                                                      &code, want);
+            if (fits > 0) {
+                reinterpret_cast<Add>(image_base + InventoryAddOffset)(inventory, &key,
+                                                                       std::min(fits, want));
+            }
+            const s32 added = std::max(BbscInventoryCount(inventory, code) - before, 0);
+            (inventory == carried ? arrived : stored) += added;
+        }
+        total += arrived + stored;
+        summary += fmt::format(" {} +{}/{} ({} carried, {} stored)", id, arrived + stored, count,
+                               arrived, stored);
+    }
+    LOG_INFO(Debug, "BBSC communion bell: supplies from {} added, {} in all:{}", from, total,
+             summary);
+    return total;
+}
+
 struct BbscGearGifts {
     std::vector<u32> queue;
     std::vector<u32> awarded;
@@ -15366,8 +15450,9 @@ void TickBbscCommunion() {
             was_busy = busy;
         }
     }
-    // What we offer: the key items we carry or store, then our weapons and runes (tagged).
-    const auto offer = [](size_t& key_count, std::vector<u32>& gear) {
+    // What we offer: the key items we carry or store, then our weapons and runes, then our
+    // supplies (both tagged).
+    const auto offer = [](size_t& key_count, std::vector<u32>& gear, std::vector<u32>& goods) {
         const u64 carried = BbscCarriedInventory();
         const u64 storage = BbscStorageInventory();
         std::vector<u32> have;
@@ -15380,7 +15465,9 @@ void TickBbscCommunion() {
         }
         key_count = have.size();
         gear = BbscHeldGearTagged();
+        goods = BbscHeldGoodsTagged();
         have.insert(have.end(), gear.begin(), gear.end());
+        have.insert(have.end(), goods.begin(), goods.end());
         return have;
     };
     // Guest: our host drank - answer with what we have. Our key items too, from the list noted at
@@ -15388,7 +15475,8 @@ void TickBbscCommunion() {
     if (bbsc_communion_host_asked.exchange(false) && state == 6) {
         size_t key_count = 0;
         std::vector<u32> gear;
-        std::vector<u32> answer = offer(key_count, gear);
+        std::vector<u32> goods;
+        std::vector<u32> answer = offer(key_count, gear, goods);
         for (const u32 id : bbsc_keys_before_session) {
             if (std::ranges::find(bbsc_key_goods_ids, id) != bbsc_key_goods_ids.end() &&
                 std::ranges::find(answer, id) == answer.end()) {
@@ -15397,9 +15485,9 @@ void TickBbscCommunion() {
             }
         }
         SendBbscCommunionPacket(5, answer);
-        LOG_INFO(Debug, "BBSC communion bell: the host drank - sent it our {} key item(s) and {} "
-                        "weapon(s), armour and rune(s)",
-                 key_count, gear.size());
+        LOG_INFO(Debug, "BBSC communion bell: the host drank - sent it our {} key item(s), {} "
+                        "weapon(s), armour and rune(s) and {} kind(s) of supplies",
+                 key_count, gear.size(), goods.size());
         BbscAnnounce(u"The host shares in your progress.", "communion shared with the host");
     }
     // Host: our drink's answers, once every guest had the time to answer.
@@ -15421,16 +15509,22 @@ void TickBbscCommunion() {
         } else {
             size_t given = 0;
             std::vector<u32> keys;
+            std::vector<u32> goods; // every guest's supplies add up
             bbsc_communion_gear.clear();
             for (const std::vector<u32>& answer : answers) {
                 for (const u32 id : answer) {
                     const u32 tag = id & 0xF0000000u;
+                    if (tag == BbscGearGoodsTag) {
+                        goods.push_back(id);
+                        continue;
+                    }
                     std::vector<u32>& into = BbscIsGearTag(tag) ? bbsc_communion_gear : keys;
                     if (std::ranges::find(into, id) == into.end()) {
                         into.push_back(id);
                     }
                 }
             }
+            const s32 supplies = GiveBbscCommunionGoods(goods, "our guests");
             for (const u32 id : keys) {
                 if (std::ranges::find(bbsc_key_goods_ids, id) == bbsc_key_goods_ids.end()) {
                     continue; // only key items, whatever the packet says
@@ -15449,14 +15543,16 @@ void TickBbscCommunion() {
             bbsc_communion_gear.clear(); // ours now, not for a later trip home
             const bool gear = !bbsc_gear_gifts.queue.empty();
             LOG_INFO(Debug, "BBSC communion bell: {} guest(s) answered with {} key item(s), {} new to "
-                            "us now given; {} new weapon(s), armour and rune(s) follow",
-                     answers.size(), keys.size(), given, bbsc_gear_gifts.queue.size());
+                            "us now given; {} supplies added; {} new weapon(s), armour and rune(s) "
+                            "follow",
+                     answers.size(), keys.size(), given, supplies, bbsc_gear_gifts.queue.size());
             const std::string text =
-                gear ? fmt::format("Communion complete: {} key item(s) received\nfrom your guests. "
-                                   "Weapons, armor and runes follow.",
-                                   given)
-                     : fmt::format("Communion complete: {} key item(s) received\nfrom your guests.",
-                                   given);
+                gear ? fmt::format("Communion complete: {} key item(s) and {} supplies\nfrom your "
+                                   "guests. Weapons, armor and runes follow.",
+                                   given, supplies)
+                     : fmt::format("Communion complete: {} key item(s) and {} supplies\nreceived "
+                                   "from your guests.",
+                                   given, supplies);
             static std::u16string announce;
             announce.assign(text.begin(), text.end());
             BbscAnnounce(announce.c_str(), "communion done (host)");
@@ -15467,15 +15563,16 @@ void TickBbscCommunion() {
     if (state == 3 && bbsc_communion_requested.exchange(false)) {
         size_t key_count = 0;
         std::vector<u32> gear;
-        SendBbscCommunionPacket(2, offer(key_count, gear));
+        std::vector<u32> goods;
+        SendBbscCommunionPacket(2, offer(key_count, gear, goods));
         const auto count = [&gear](u32 tag) {
             return static_cast<size_t>(std::ranges::count_if(
                 gear, [tag](u32 t) { return (t & 0xF0000000u) == tag; }));
         };
         LOG_INFO(Debug, "BBSC communion bell: a guest asked - sent our {} key item(s), {} "
-                        "weapon(s), {} armour and {} rune(s)",
+                        "weapon(s), {} armour, {} rune(s) and {} kind(s) of supplies",
                  key_count, count(BbscGearWeaponTag), count(BbscGearArmorTag),
-                 count(BbscGearRuneTag));
+                 count(BbscGearRuneTag), goods.size());
         BbscAnnounce(u"A guest shares in your progress.", "communion shared");
         host_notice_ms = SteadyNowMs();
     }
@@ -15518,7 +15615,12 @@ void TickBbscCommunion() {
     LOG_INFO(Debug, "BBSC communion bell: before the gift we hold {}", BbscHeldKeyItemsText());
     bbsc_communion_keys.clear();
     bbsc_communion_gear.clear();
+    std::vector<u32> goods;
     for (const u32 id : got) {
+        if ((id & 0xF0000000u) == BbscGearGoodsTag) {
+            goods.push_back(id);
+            continue;
+        }
         if (BbscIsGearTag(id)) {
             bbsc_communion_gear.push_back(id); // given at the trip home (TickBbscGearGifts)
             continue;
@@ -15539,24 +15641,25 @@ void TickBbscCommunion() {
             }
         }
     }
+    const s32 supplies = GiveBbscCommunionGoods(goods, "the host");
     WriteBbscPendingProgress(); // the progress collected so far is on disk now, crash or not
     SendBbscCommunionPacket(3, {static_cast<u32>(new_keys)}); // the host shows its completion
     QueueBbscGearGifts("live, after the drink");
     const size_t new_gear = bbsc_gear_gifts.queue.size();
     LOG_INFO(Debug, "BBSC communion bell: the host has {} key item(s), {} given now ({} new to this "
-                    "character, the rest ours at home); {} of its {} weapon(s), armour and rune(s) "
-                    "are new and follow now; lamps, world and boss progress and NPC states join our "
-                    "own world at the next trip home",
-             got.size() - bbsc_communion_gear.size(), given, new_keys, new_gear,
+                    "character, the rest ours at home); {} supplies added; {} of its {} weapon(s), "
+                    "armour and rune(s) are new and follow now; lamps, world and boss progress and "
+                    "NPC states join our own world at the next trip home",
+             bbsc_communion_keys.size(), given, new_keys, supplies, new_gear,
              bbsc_communion_gear.size());
     const std::string text =
         new_gear == 0
-            ? fmt::format("Communion complete: {} new key item(s).\nThe host's world joins "
-                          "yours at home.",
-                          new_keys)
-            : fmt::format("Communion complete: {} new key item(s).\n{} more item(s) "
-                          "follow; the host's world joins yours at home.",
-                          new_keys, new_gear);
+            ? fmt::format("Communion complete: {} new key item(s), {} supplies.\nThe host's "
+                          "world joins yours at home.",
+                          new_keys, supplies)
+            : fmt::format("Communion complete: {} new key item(s), {} supplies.\n{} more "
+                          "item(s) follow; the host's world joins yours at home.",
+                          new_keys, supplies, new_gear);
     static std::u16string announce;
     announce.assign(text.begin(), text.end());
     BbscAnnounce(announce.c_str(), "communion done");
