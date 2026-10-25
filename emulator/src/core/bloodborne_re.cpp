@@ -4551,6 +4551,8 @@ bool RequestBbscSessionWarp(u64 global, const SummonPlacementDescriptor& to, std
     return true;
 }
 
+void ArmBbscJoinFallGuard(const BbscTransform& spot); // see "Fall guard after a far lamp"
+
 void TickBbscJoinTeleport() {
     static bool done = false;
     static bool warp_requested = false;
@@ -4675,6 +4677,10 @@ void TickBbscJoinTeleport() {
              "({:.2f}, {:.2f}, {:.2f})",
              own ? own->position[0] : 0.0f, own ? own->position[1] : 0.0f,
              own ? own->position[2] : 0.0f, position[0], position[1], position[2]);
+    BbscTransform spot{};
+    spot.position = position;
+    spot.rotation = rotation;
+    ArmBbscJoinFallGuard(spot); // see "Fall guard after a far lamp"
     EndBbscLoadCover("guest placed beside the host");
 }
 
@@ -7351,17 +7357,30 @@ void TickBbscDeathCurtain() {
 // lamp it is, and for 25 s this watches the guest: falling fast (over 6 m in 1 s) and 15 m below
 // the lamp means there was no floor. The first time the guest is put back on the lamp, by then the
 // game has loaded the ground around it; the second time beside the host.
+// The same after a join (2026-10-25, the user: "if invoked in the atelier, second player fall"):
+// the guest placed beside the host in the Hunter's Dream workshop died 35 s later and the game
+// sent it home. For 40 s after the join teleport, a fall puts it back on that spot, and a second
+// fall at the lamp of the map nearest to it (the spot beside the host is where it fell).
 constexpr s64 BbscLampGuardMs = 25'000;
+constexpr s64 BbscJoinGuardMs = 40'000;
 constexpr float BbscLampGuardBelowM = 15.0f;
 constexpr float BbscLampGuardDropPerSecondM = 6.0f;
 struct BbscLampGuard {
     s64 since_ms = 0; // 0 = off
-    BbscTransform lamp{};
+    BbscTransform lamp{}; // or the spot beside the host, after a join
     s64 sample_ms = 0;
     float sample_y = 0.0f;
     bool put_back = false;
+    bool join = false;
 };
 BbscLampGuard bbsc_lamp_guard;
+
+void ArmBbscJoinFallGuard(const BbscTransform& spot) {
+    bbsc_lamp_guard = {};
+    bbsc_lamp_guard.since_ms = SteadyNowMs();
+    bbsc_lamp_guard.lamp = spot;
+    bbsc_lamp_guard.join = true;
+}
 
 bool WarpBbscLocalPlayer(u64 player, const BbscTransform& to) {
     const u64 vtable = ReadValue<u64>(player, 0);
@@ -7394,8 +7413,11 @@ void TickBbscLampGuard() {
         guard.since_ms = 0;
         return;
     }
-    if (now - guard.since_ms > BbscLampGuardMs) {
-        LOG_INFO(Debug, "BBSC respawn: the far lamp held (no fall in {} s)", BbscLampGuardMs / 1000);
+    const s64 window = guard.join ? BbscJoinGuardMs : BbscLampGuardMs;
+    const std::string_view spot = guard.join ? "the spot beside the host" : "the far lamp";
+    if (now - guard.since_ms > window) {
+        LOG_INFO(Debug, "BBSC {}: {} held (no fall in {} s)", guard.join ? "join" : "respawn", spot,
+                 window / 1000);
         guard.since_ms = 0;
         return;
     }
@@ -7418,13 +7440,21 @@ void TickBbscLampGuard() {
         guard.since_ms = now;
         guard.sample_ms = 0;
         const bool moved = WarpBbscLocalPlayer(player, guard.lamp);
-        LOG_INFO(Debug, "BBSC respawn: falling below the far lamp ({:.0f} m in 1 s, {:.0f} m under "
-                        "it) - {}",
-                 drop, guard.lamp.position[1] - y,
-                 moved ? "put back on the lamp" : "could not move the player");
+        LOG_INFO(Debug, "BBSC {}: falling below {} ({:.0f} m in 1 s, {:.0f} m under it) - {}",
+                 guard.join ? "join" : "respawn", spot, drop, guard.lamp.position[1] - y,
+                 moved ? "put back on it" : "could not move the player");
         return;
     }
     guard.since_ms = 0;
+    if (guard.join) {
+        s32 point = -1;
+        const auto lamp = ResolveNearestLoadedLamp(guard.lamp.position, &point);
+        const bool moved = lamp.has_value() && WarpBbscLocalPlayer(player, *lamp);
+        LOG_INFO(Debug, "BBSC join: fell below the spot beside the host again ({:.0f} m in 1 s) - {}",
+                 drop, moved ? fmt::format("put at lamp {}, the nearest", point)
+                             : std::string("no lamp of this map to go to"));
+        return;
+    }
     const u64 partner = FindLivingPartnerCharacter();
     auto beside = partner != 0 ? ReadCharacterTransform(partner) : std::nullopt;
     if (beside.has_value()) {
