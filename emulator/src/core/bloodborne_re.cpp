@@ -8525,6 +8525,19 @@ void PS4_SYSV_ABI BbscSpectateDeathHook(u64 tag, const GuestRegisterSnapshot* re
     }
     bbsc_echoes_at_death = GetBloodEchoes();
     bbsc_kept_death_this_load = true;
+    // A kept death keeps its echoes until it is clear nobody revives the hunter (2026-10-25, the
+    // user: revived by the guest, the host had to pick its 105 echoes up off the floor).
+    // SoloPlayDeath_2 drops them unless global+0x1649 is set (0x01381F04; the step clears it after),
+    // so it is set here and the drop waits for BbscApplyDeathPenalty: at the lamp, in a wipe, or
+    // when the boss fight ends. A revive keeps them. A guest's echoes already stay through
+    // PartyGhostDeath_2 (2026-10-25 01:21:48 to 01:22:17, the guest's 108932).
+    if (tag == 0) {
+        if (const u64 global = GetGlobalState(); ReadablePointer(global, 0x1650) &&
+                                                 HasMemoryAccess(global + 0x1649, 1,
+                                                                 MemoryProt::CpuWrite)) {
+            WriteValue<u8>(global, 0x1649, 1);
+        }
+    }
     StashBbscOwnWorldSnapshot();
     bbsc_spectate_name = name;
     bbsc_spectate_since_ms = SteadyNowMs();
@@ -8702,6 +8715,7 @@ void TickBbscSpectate() {
              now - bbsc_spectate_since_ms, reason);
     bbsc_spectate_active = false;
     bbsc_spectate_releasing = true;
+    BbscApplyDeathPenalty(reason); // the drop the death step left to us, before the reload
     RequestBbscDeathReload(reason);
     bbsc_spectate_releasing = false;
 }
