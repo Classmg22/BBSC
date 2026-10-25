@@ -8588,6 +8588,23 @@ void TickBbscSpectate() {
                 to.y = host_transform->position[1];
                 to.z = host_transform->position[2];
                 to.heading = host_transform->rotation[1];
+                // Our death step left the load set up as our own death's (event state
+                // [0x0553B0D8] = 2, the death globals +0x1522 / +0x1523), and the wipe warp went
+                // out as a respawn at our own last lamp (stage request subtype 2) instead of the
+                // host's spot (subtype 1, as a follow load). 2026-10-25 17:07: the guest's last
+                // lamp was in the Hunter's Dream, it woke up there, and a follow load had to bring
+                // it to the host. Before, it only worked when the guest's own lamp was in the host's
+                // map (2026-10-24 21:14: subtype 2, lamp 2422951). Cleared here as the revive in
+                // place clears them. HYPOTHESIS that these pick subtype 2; the trace shows it.
+                if (const u64 global = GetGlobalState(); ReadablePointer(global, 0x1528)) {
+                    WriteValue<u8>(global, 0x1522, 0);
+                    WriteValue<u8>(global, 0x1523, 0);
+                }
+                if (const u64 event_state = ReadValue<u64>(image_base + 0x0553B0D8, 0);
+                    ReadablePointer(event_state, 4) &&
+                    HasMemoryAccess(event_state, 4, MemoryProt::CpuWrite)) {
+                    WriteValue<s32>(event_state, 0, 0);
+                }
                 if (RequestBbscSessionWarp(GetGlobalState(), to, "wipe")) {
                     return; // the load builds a new character: "a load ended the boss fight"
                 }
