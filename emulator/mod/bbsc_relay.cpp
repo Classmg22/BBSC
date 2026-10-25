@@ -57,6 +57,7 @@ constexpr u8 ScaleType = 0x24;  // "SHAD" 0x24 + 5 x u16 the host's scaling perc
 constexpr u8 PvpType = 0x25;    // "SHAD" 0x25 + u8 kind (0 host state, 1 guest asks) + u8 on + u32
 constexpr u8 ProgressType = 0x26; // "SHAD" 0x26 + u8 count + count x u32 the host's boss flags
 constexpr u8 HostBossType = 0x27; // "SHAD" 0x27 + s32 the boss on the host's boss bar (-1 none)
+constexpr u8 StainType = 0x2B; // "SHAD" 0x2B + u8 kind (1 new, 2 picked up, 3 lost) + u32 the host's stain
 constexpr u8 PeersType = 0x7F; // server -> client: "N other players are connected", 1 byte count
 // Every frame since 2026-10-06: "SHAD" 0x40 + u32 sender + u32 session (the host's sender id, 0 = in
 // no session) + the packet above. The server sends each frame to everyone connected to it, so the
@@ -331,6 +332,12 @@ void Dispatch(const std::vector<u8>& wrapped) {
             std::int32_t boss = -1;
             std::memcpy(&boss, frame.data() + 5, 4);
             Core::Bloodborne::OnBbscHostBossPacket(boss);
+        }
+    } else if (frame[4] == StainType && frame.size() >= 10) {
+        if (from_our_host()) {
+            std::uint32_t stain = 0;
+            std::memcpy(&stain, frame.data() + 6, 4);
+            Core::Bloodborne::OnBbscStainPacket(frame[5], stain);
         }
     } else if (frame[4] == PlacementType) {
         // A host looking for signs: for players not in a session yet, any host on the server.

@@ -46,6 +46,9 @@ void OnBbscPvpPacket(std::uint8_t kind, std::uint8_t on);
 void OnBbscProgressPacket(const std::uint32_t* flags, std::size_t count);
 // BBSC boss line: the boss on the host's boss bar (name id, -1 none; relay "SHAD" 0x27).
 void OnBbscHostBossPacket(std::int32_t boss);
+// BBSC wipes: the host's bloodstain (relay "SHAD" 0x2B): kind 1 a new one, 2 picked up, 3 lost,
+// with the host's number for that stain. Relay thread; only stored.
+void OnBbscStainPacket(std::uint8_t kind, std::uint32_t stain);
 void NoteBbscRelayHost(std::uint32_t sender, std::uint32_t packed_map, float x, float y, float z);
 std::uint32_t GetBbscRelayHost();
 // The relay sender of a host that rang our sign (aimed placement, mod): a joining guest takes that

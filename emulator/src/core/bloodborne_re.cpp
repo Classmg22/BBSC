@@ -8290,6 +8290,185 @@ void ShowBbscGuestDeathText(u64 event_object) {
     RaiseBbscDeathText(event_object, "guest");
 }
 
+// ---- A guest's echoes in a wipe go with the host's bloodstain (2026-10-25) -----------------------
+// The game shows and picks up a bloodstain only in its owner's world (0x013D2DC0 checks
+// global+0x1592), so a guest's stain from a wipe lay in its own world, never where it fell (the
+// user: "2nd player lost his echoes, no way to get them back after a wipe"). The user's rule: the
+// guest's echoes go with the host's bloodstain of that wipe. The host picks it up: they come back
+// to the guest. The host's stain is lost unpicked (it died again): they are lost too. The session
+// ends first, or no stain of the host's comes: the guest keeps them.
+// Host: its stain record is watched every second ([0x0553B130]+0x28 "a stain exists",
+// [[0x0553B130]+0x30] +0x38 echoes, +0x18 spot, +0x3C map). A new one, one picked up (gone while
+// the echoes rose by what it held) and one replaced unpicked are sent with the stain's number. One
+// gone without the echoes (an enemy took them) counts as picked up when the echoes later rise by
+// that much at once, before the next stain.
+constexpr u8 BbscStainType = 0x2B;
+constexpr s64 BbscStainBindMs = 60'000;     // a host's new stain this close to our wipe is its
+constexpr s64 BbscStainUnboundMs = 120'000; // no stain of the host's came: the guest keeps them
+struct BbscGuestStainEchoes {
+    s32 amount = 0;
+    u32 stain = 0; // the host's stain they went with, 0 = not known yet
+    s64 since_ms = 0;
+};
+std::mutex bbsc_stain_mutex;
+BbscGuestStainEchoes bbsc_stain_held; // guest, game thread
+u32 bbsc_stain_host_new = 0;          // guest: the host's last new stain, and when it came
+s64 bbsc_stain_host_new_ms = 0;
+std::vector<std::pair<u8, u32>> bbsc_stain_events; // guest: from the relay, for the game tick
+
+void SendBbscStainPacket(u8 kind, u32 stain) {
+    std::array<u8, 10> packet{'S', 'H', 'A', 'D', BbscStainType, kind};
+    std::memcpy(packet.data() + 6, &stain, 4);
+    Libraries::Np::NpSignaling::Helpers::SendBbscWorldFlagsToPeers(packet.data(),
+                                                                    static_cast<u32>(packet.size()));
+}
+
+// Guest: the echoes held at our death leave us and wait for the host's bloodstain.
+void HoldBbscWipeEchoes(s32 amount, std::string_view why) {
+    const u64 local = GetPlayerSlotData();
+    const s32 now = GetBloodEchoes();
+    if (local == 0 || now < 0 || amount <= 0) {
+        return;
+    }
+    const s32 taken = std::min(amount, now);
+    WriteValue<s32>(local, PlayerEchoesOffset, now - taken);
+    const s64 at = SteadyNowMs();
+    bbsc_stain_held.amount += taken;
+    bbsc_stain_held.since_ms = at;
+    bbsc_stain_held.stain = bbsc_stain_host_new != 0 && at - bbsc_stain_host_new_ms < BbscStainBindMs
+                                ? bbsc_stain_host_new
+                                : 0;
+    LOG_INFO(Debug, "BBSC death penalty ({}): a guest in a wipe - {} echoes go with the host's "
+                    "bloodstain ({}), {} held in all",
+             why, taken,
+             bbsc_stain_held.stain != 0 ? fmt::format("its stain {}", bbsc_stain_held.stain)
+                                        : std::string("its next stain"),
+             bbsc_stain_held.amount);
+}
+
+void GiveBackBbscWipeEchoes(std::string_view why) {
+    const u64 local = GetPlayerSlotData();
+    const s32 now = GetBloodEchoes();
+    if (bbsc_stain_held.amount <= 0 || local == 0 || now < 0) {
+        return;
+    }
+    WriteValue<s32>(local, PlayerEchoesOffset, now + bbsc_stain_held.amount);
+    LOG_INFO(Debug, "BBSC wipe echoes: {} echoes back ({}), now {}", bbsc_stain_held.amount, why,
+             GetBloodEchoes());
+    bbsc_stain_held = {};
+}
+
+// Game thread: the host watches its stain, the guest acts on the host's.
+void TickBbscWipeEchoes() {
+    static s64 last_ms = 0;
+    const s64 now = SteadyNowMs();
+    if (image_base == 0 || now - last_ms < 1'000) {
+        return;
+    }
+    last_ms = now;
+    const s32 state = GetSessionState();
+    const u64 global = GetGlobalState();
+    const bool loading = !ReadablePointer(global, 0x10) || ReadValue<u8>(global, 0x08) != 0;
+
+    // Host.
+    static u32 stain = 0;               // our stain's number
+    static bool seen = false;           // the record was read once in this session
+    static u8 last_exists = 0;
+    static s32 last_held = 0;
+    static std::array<u32, 4> last_spot{}; // x, y, z, map as raw bits
+    static s32 last_echoes = -1;
+    static s32 taken_held = -1;            // gone without the echoes: an enemy may hold them
+    if (state != 3) {
+        seen = false;
+        taken_held = -1;
+    } else if (!loading) {
+        const u64 slots = ReadValue<u64>(image_base + PlayerSlotManagerPointerOffset, 0);
+        const u64 record = ReadablePointer(slots, 0x38) ? ReadValue<u64>(slots, 0x30) : 0;
+        const s32 echoes = GetBloodEchoes();
+        if (ReadablePointer(record, 0x40) && echoes >= 0) {
+            const u8 exists = ReadValue<u8>(slots, 0x28);
+            const s32 held = ReadValue<s32>(record, 0x38);
+            const std::array<u32, 4> spot{ReadValue<u32>(record, 0x18), ReadValue<u32>(record, 0x1C),
+                                          ReadValue<u32>(record, 0x20), ReadValue<u32>(record, 0x3C)};
+            const bool there = exists != 0 && held > 0;
+            const bool was = last_exists != 0 && last_held > 0;
+            if (!seen) {
+                seen = true; // a stain from before the session is not one of its wipes
+            } else if (there && (!was || held != last_held || spot != last_spot)) {
+                if (was) {
+                    SendBbscStainPacket(3, stain);
+                    LOG_INFO(Debug, "BBSC wipe echoes: our stain {} replaced before it was picked up "
+                                    "- lost (sent)",
+                             stain);
+                }
+                ++stain;
+                taken_held = -1;
+                SendBbscStainPacket(1, stain);
+                LOG_INFO(Debug, "BBSC wipe echoes: our new stain {} holds {} (sent)", stain, held);
+            } else if (!there && was) {
+                if (last_echoes >= 0 && echoes - last_echoes >= last_held) {
+                    SendBbscStainPacket(2, stain);
+                    LOG_INFO(Debug, "BBSC wipe echoes: our stain {} picked up ({} echoes, sent)",
+                             stain, last_held);
+                } else {
+                    taken_held = last_held;
+                    LOG_INFO(Debug, "BBSC wipe echoes: our stain {} gone without its {} echoes "
+                                    "(an enemy holds them?) - waiting for them",
+                             stain, last_held);
+                }
+            } else if (taken_held > 0 && last_echoes >= 0 && echoes - last_echoes >= taken_held) {
+                SendBbscStainPacket(2, stain);
+                LOG_INFO(Debug, "BBSC wipe echoes: our stain {}'s {} echoes came back (sent)", stain,
+                         taken_held);
+                taken_held = -1;
+            }
+            last_exists = exists;
+            last_held = held;
+            last_spot = spot;
+            last_echoes = echoes;
+        }
+    }
+
+    // Guest.
+    std::vector<std::pair<u8, u32>> events;
+    {
+        std::scoped_lock lock{bbsc_stain_mutex};
+        events.swap(bbsc_stain_events);
+    }
+    for (const auto& [kind, host_stain] : events) {
+        if (kind == 1) {
+            bbsc_stain_host_new = host_stain;
+            bbsc_stain_host_new_ms = now;
+            if (bbsc_stain_held.amount > 0 && bbsc_stain_held.stain == 0) {
+                bbsc_stain_held.stain = host_stain;
+                LOG_INFO(Debug, "BBSC wipe echoes: our {} echoes go with the host's stain {}",
+                         bbsc_stain_held.amount, host_stain);
+            }
+        } else if (bbsc_stain_held.amount > 0 && host_stain == bbsc_stain_held.stain) {
+            if (kind == 2 && !loading) {
+                GiveBackBbscWipeEchoes("the host picked up its bloodstain");
+                BbscAnnounce(u"The host recovered the blood echoes.\nYours came back too.",
+                             "wipe echoes back");
+            } else if (kind == 2) {
+                std::scoped_lock lock{bbsc_stain_mutex};
+                bbsc_stain_events.emplace_back(kind, host_stain); // after the load
+            } else if (kind == 3) {
+                LOG_INFO(Debug, "BBSC wipe echoes: the host's stain {} was lost - our {} echoes "
+                                "with it",
+                         host_stain, bbsc_stain_held.amount);
+                bbsc_stain_held = {};
+            }
+        }
+    }
+    if (bbsc_stain_held.amount > 0 && !loading) {
+        if (state != 6) {
+            GiveBackBbscWipeEchoes("the session ended before the host picked up its stain");
+        } else if (bbsc_stain_held.stain == 0 && now - bbsc_stain_held.since_ms > BbscStainUnboundMs) {
+            GiveBackBbscWipeEchoes("no bloodstain of the host's came");
+        }
+    }
+}
+
 // Drop the stain unless the game already did it for this death. Returns true when BBSC made the
 // call itself.
 bool BbscApplyDeathPenalty(std::string_view why) {
@@ -8298,13 +8477,11 @@ bool BbscApplyDeathPenalty(std::string_view why) {
     }
     const s32 before = bbsc_echoes_at_death;
     bbsc_echoes_at_death = -1;
-    // A guest keeps its echoes in a wipe (2026-10-25, the user's choice). The game shows and picks
-    // up a bloodstain only in its owner's world (0x013D2DC0 checks global+0x1592), so a guest's
-    // stain lay in its own world, never in the host's: "lost his echoes, no way to get them back".
-    // Dropped after the reload it was worse, in map 0xffffffff (2026-10-25 01:22, 108932 echoes).
+    // A guest's echoes in a wipe go with the host's bloodstain, see HoldBbscWipeEchoes. Its own
+    // stain would lie in its own world, and dropped after the reload it was worse: map 0xffffffff
+    // (2026-10-25 01:22, 108932 echoes).
     if (bbsc_spectate_saw_wipe && GetSessionState() == 6) {
-        LOG_INFO(Debug, "BBSC death penalty ({}): a guest in a wipe keeps its {} echoes", why,
-                 GetBloodEchoes());
+        HoldBbscWipeEchoes(before, why);
         return false;
     }
     s32 now = GetBloodEchoes();
@@ -16320,6 +16497,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         TickBbscStageWatch();
         TickBbscHostDeathNotice();
         TickBbscBossUnlock();
+        TickBbscWipeEchoes();
         TickBbscStaleBossBar();
         CaptureBbscGuestLoot();
         TickBbscGuestLootReset();
@@ -16983,6 +17161,13 @@ bool BbscConnectFirstPlacementFresh() {
 }
 
 } // namespace
+
+void OnBbscStainPacket(std::uint8_t kind, std::uint32_t stain) {
+    std::scoped_lock lock{bbsc_stain_mutex};
+    if (bbsc_stain_events.size() < 32) {
+        bbsc_stain_events.emplace_back(kind, stain);
+    }
+}
 
 void OnBbscHostBossPacket(std::int32_t boss) {
     bbsc_host_boss_id = boss;
