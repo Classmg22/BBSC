@@ -9800,6 +9800,22 @@ constexpr u64 EventSfxBankOffset = 0x017C64E0;    // EMEVD bank 2006 handler (rd
 constexpr std::array<s64, 2> BbscCoopWallEvents{7600, 12907600};
 constexpr size_t BbscWallTraceLimit = 800;
 
+// A boss exit the game also shuts for multiplayer (2026-10-24, tester hosting at Ludwig's lamp:
+// the fog after the boss stayed). m34's event 13400010 raises wall 3401801 and fog 3403801 ("boss
+// 1-2 exit") while Ludwig lives (flag 9471 off) or in multiplayer state 2 or 3, and hides them only
+// when neither holds. BBSC keeps the co-op after a boss, so the exit stayed shut for the session.
+// Once the boss flag is set, the script's raises are refused as a co-op wall's are, and a wall
+// raised before the kill is hidden by TickBbscBossExitWalls. A survey of every EMEVD (a multiplayer
+// check 3[06] next to a fog-on 2006[02], 7600 / 12907600 aside) found no other wall like it.
+struct BbscBossExitWall {
+    s64 event;
+    u32 object;
+    u32 fog;
+    u32 boss_flag;
+};
+constexpr std::array<BbscBossExitWall, 1> BbscBossExitWalls{{{13400010, 3401801, 3403801, 9471}}};
+constexpr u64 ObjectSfxDeleteOffset = 0x01315E50; // (_, entity_id, now), what 2006[1] calls
+
 u8 bbsc_wall_draw_skip = 0;
 u8 bbsc_wall_collision_skip = 0;
 u8 bbsc_wall_sfx_skip = 0;
@@ -9889,8 +9905,12 @@ void PS4_SYSV_ABI BbscWallScriptHook(u64 tag, const GuestRegisterSnapshot* regis
         return;
     }
     const s64 event = BbscRunningEventId(instance);
+    const auto exit_wall =
+        std::find_if(BbscBossExitWalls.begin(), BbscBossExitWalls.end(),
+                     [event](const BbscBossExitWall& wall) { return wall.event == event; });
     if (std::find(BbscCoopWallEvents.begin(), BbscCoopWallEvents.end(), event) ==
-        BbscCoopWallEvents.end()) {
+            BbscCoopWallEvents.end() &&
+        (exit_wall == BbscBossExitWalls.end() || !BbscEventFlag(exit_wall->boss_flag))) {
         return;
     }
     bbsc_coop_wall_entity = static_cast<u32>(entity);
@@ -9986,6 +10006,51 @@ void InstallBbscWallHooks() {
     LOG_INFO(Debug,
              "BBSC fog walls: co-op walls kept off wherever event 7600 / 12907600 raises them "
              "(base game, DLC, Chalice); boss walls untouched");
+}
+
+// A boss exit wall raised while its boss was alive stays up in a session after the kill (the
+// script waits for the multiplayer to end): hide it once the boss flag is set, once per load and
+// session. ObjectDraw / ObjectCollision walk [0x0553B168] and the fog delete [0x0553B178] without
+// a null check.
+void TickBbscBossExitWalls() {
+    static std::array<bool, BbscBossExitWalls.size()> hidden{};
+    static s64 last_ms = 0;
+    if (image_base == 0 || !BbscNoFogWallsEnabled()) {
+        return;
+    }
+    const s64 now = SteadyNowMs();
+    if (now - last_ms < 1'000) {
+        return;
+    }
+    last_ms = now;
+    const s32 session_state = GetSessionState();
+    const u64 global = GetGlobalState();
+    if ((session_state != 3 && session_state != 6) || !ReadablePointer(global, 0x10) ||
+        ReadValue<u8>(global, 0x08) != 0) {
+        hidden.fill(false);
+        return;
+    }
+    if (ReadValue<u64>(image_base + 0x0553B168, 0) == 0 ||
+        ReadValue<u64>(image_base + 0x0553B148, 0) == 0 ||
+        ReadValue<u64>(image_base + 0x0553B178, 0) == 0) {
+        return;
+    }
+    using ObjectSwitch = u64 PS4_SYSV_ABI (*)(u32 entity_id, u32 on);
+    using SfxDelete = u64 PS4_SYSV_ABI (*)(u64 unused, u32 entity_id, u32 now);
+    for (size_t k = 0; k < BbscBossExitWalls.size(); ++k) {
+        const BbscBossExitWall& wall = BbscBossExitWalls[k];
+        if (hidden[k] || !BbscEventFlag(wall.boss_flag)) {
+            continue;
+        }
+        hidden[k] = true;
+        reinterpret_cast<ObjectSwitch>(image_base + ObjectDrawOffset)(wall.object, 0);
+        reinterpret_cast<ObjectSwitch>(image_base + ObjectCollisionOffset)(wall.object, 0);
+        reinterpret_cast<SfxDelete>(image_base + ObjectSfxDeleteOffset)(0, wall.fog, 1);
+        LOG_INFO(Debug,
+                 "BBSC fog wall: boss exit wall {} and fog {} hidden in the session (event {}, "
+                 "boss flag {} set, map {:#x})",
+                 wall.object, wall.fog, wall.event, wall.boss_flag, GetCurrentPackedMap());
+    }
 }
 
 // ---- The Hunter's Dream together (2026-09-25) --------------------------------------------------
@@ -16082,6 +16147,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         TickBbscStageWatch();
         TickBbscHostDeathNotice();
         TickBbscBossUnlock();
+        TickBbscBossExitWalls();
         CaptureBbscGuestLoot();
         TickBbscGuestLootReset();
         TickBbscDreamStateRestore();
