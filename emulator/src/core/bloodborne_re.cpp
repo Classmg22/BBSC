@@ -8298,6 +8298,15 @@ bool BbscApplyDeathPenalty(std::string_view why) {
     }
     const s32 before = bbsc_echoes_at_death;
     bbsc_echoes_at_death = -1;
+    // A guest keeps its echoes in a wipe (2026-10-25, the user's choice). The game shows and picks
+    // up a bloodstain only in its owner's world (0x013D2DC0 checks global+0x1592), so a guest's
+    // stain lay in its own world, never in the host's: "lost his echoes, no way to get them back".
+    // Dropped after the reload it was worse, in map 0xffffffff (2026-10-25 01:22, 108932 echoes).
+    if (bbsc_spectate_saw_wipe && GetSessionState() == 6) {
+        LOG_INFO(Debug, "BBSC death penalty ({}): a guest in a wipe keeps its {} echoes", why,
+                 GetBloodEchoes());
+        return false;
+    }
     s32 now = GetBloodEchoes();
     if (before < 0 || now < 0) {
         return false; // no snapshot, or the slot data went away with the world
@@ -8556,7 +8565,6 @@ void TickBbscSpectate() {
         bbsc_spectate_saw_wipe = true;
         LOG_INFO(Debug, "BBSC spectate: a partner said dead and then alive while we were down - "
                         "it reloaded after a wipe, the guest follows");
-        BbscApplyDeathPenalty("wipe, before our reload"); // see "nobody alive" below
     }
     if (session_alive && LivingPartnerExists()) {
         std::string_view respawn_why;
@@ -8677,11 +8685,6 @@ void TickBbscSpectate() {
                 LOG_INFO(Debug, "BBSC spectate: nobody alive - guest waits for the host's reload "
                                 "(up to {} s) instead of reloading itself",
                          BbscGuestWaitHostMs / 1'000);
-                // The echoes go into the stain now, while our body still lies where it fell.
-                // Dropped after the host's reload, they went on the new character, which has no
-                // map yet: the stain went to map 0xffffffff at a Hunter's Dream spot and never
-                // showed (2026-10-25 01:22, the guest lost 108932 echoes that way).
-                BbscApplyDeathPenalty("wipe, before the host's reload");
             }
             return;
         }
