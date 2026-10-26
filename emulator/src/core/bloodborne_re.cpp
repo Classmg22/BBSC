@@ -3840,6 +3840,62 @@ void TickBbscReinsertV8() {
     LogBbscSessionShape("v8 restarted", true);
 }
 
+// A phantom at home (2026-10-24 20:10, the user: "can't ring on guest"): the kept death sets the
+// own-world restore type to the phantom's (see SetOwnWorldRestoreType) and TickBbscReinsertV8
+// puts it back once the respawn is done or times out - both on this game thread. The host crashed
+// in that respawn's load and the guest's game froze there (20:05:46, log ends), so it was never
+// put back, the save kept it, and the next start built the guest as type 1 in its own world:
+// slot and character type 1, own world 1, session state 0 - and the bells refused it ("not for
+// this player type"). At home, not loading, with no kept death pending, any phantom type left on
+// the restore record, the slot (+0xA4) or the live character (+0x78) is set back to 0, once.
+bool BbscIsPhantomType(s32 type) {
+    return type == 1 || type == 2 || type == 12 || type == 13;
+}
+
+void TickBbscHomeTypeRepair() {
+    static s64 last_ms = 0;
+    const s64 now = SteadyNowMs();
+    if (now - last_ms < 1'000) {
+        return;
+    }
+    last_ms = now;
+    const u64 global = GetGlobalState();
+    if (bbsc_v8_pending || GetSessionState() != 0 || !ReadablePointer(global, 0x1593) ||
+        ReadValue<u8>(global, 0x1592) != 1 || ReadValue<u8>(global, 0x08) != 0 ||
+        GetBbscLocalPlayerHp() <= 0) {
+        return;
+    }
+    const u64 record = ReadValue<u64>(image_base + 0x0553B188, 0);
+    const s32 restore = ReadablePointer(record, 0x08) ? ReadValue<s32>(record, 4) : -1;
+    const s32 slot_type = GetLocalPlayerType();
+    const s32 chr_type = GetLocalCharacterType();
+    if (!BbscIsPhantomType(restore) && !BbscIsPhantomType(slot_type) &&
+        !BbscIsPhantomType(chr_type)) {
+        return;
+    }
+    if (BbscIsPhantomType(restore)) {
+        SetOwnWorldRestoreType(0, nullptr);
+    }
+    const u64 slots = ReadValue<u64>(image_base + PlayerSlotManagerPointerOffset, 0);
+    const u64 local = ReadablePointer(slots, 0x10) ? ReadValue<u64>(slots, 0x08) : 0;
+    if (BbscIsPhantomType(slot_type) && ReadablePointer(local, 0xA8) &&
+        HasMemoryAccess(local + 0xA4, 4, MemoryProt::CpuWrite)) {
+        WriteValue<s32>(local, 0xA4, 0);
+    }
+    const u64 world_chr = ReadValue<u64>(image_base + CandidateLocalStatePointerOffset, 0);
+    const u64 player = ReadablePointer(world_chr, 0x68) ? ReadValue<u64>(world_chr, 0x60) : 0;
+    if (BbscIsPhantomType(chr_type) && ReadablePointer(player, 0x80) &&
+        HasMemoryAccess(player + 0x78, 4, MemoryProt::CpuWrite)) {
+        WriteValue<s32>(player, 0x78, 0);
+    }
+    LOG_WARNING(Debug, "BBSC home type: a phantom's type at home (restore {}, slot {}, character {}) "
+                       "- set back to 0",
+                restore, slot_type, chr_type);
+    BBSC_TIMELINE("SESSION", "home type: a phantom's type at home (restore {}, slot {}, character {}) "
+                             "- set back to 0",
+                  restore, slot_type, chr_type);
+}
+
 // Self-heal (host and guest): a member task that reached CreateWait (6) but whose character is gone
 // for BbscSelfHealMissingMs while no load is running gets its create step re-run. This is what
 // brings the guest back on the host's screen after a HOST death (the host's load destroys the
@@ -4163,7 +4219,15 @@ struct BbscTransform {
     std::array<float, 4> rotation{};
 };
 
-enum class BbscDeathMode : u8 { Spectate, RespawnNow };
+// Downed (2026-10-24): no boss fight, the fallen hunter waits to be revived or for its own choice
+// to go to the lamp (see "Reviving a fallen hunter").
+enum class BbscDeathMode : u8 { Spectate, RespawnNow, Downed };
+bool BbscReviveEnabled();   // see "Reviving a fallen hunter"
+bool BbscReviveGiveUp();    // the fallen hunter held Circle: to the lamp
+std::atomic<bool> bbsc_revive_received{false}; // a partner finished reviving us
+bool bbsc_free_camera_on_down = false;          // down: the free camera starts by itself (game thread)
+constexpr s32 BbscReviveGlowEffectId = 3010; // the Blood Vial's look, see "Reviving a fallen hunter"
+void BbscAddEffect(u64 chr, s32 id);         // see "Reviving a fallen hunter"
 
 BbscDeathMode bbsc_death_mode = BbscDeathMode::Spectate;
 s64 bbsc_boss_cleared_since_ms = 0;
@@ -7383,6 +7447,8 @@ bool BbscDiedRightAfterRespawn(std::string_view why) {
     return true;
 }
 
+constexpr std::string_view BbscRevivedWhy = "revived by a hunter";
+
 bool BbscRespawnInPlace(std::string_view why) {
     // Replicates the local-player branch of the game's event revive 0x013CBAD0(10000, ...)
     // (CONFIRMED statically), in the same order, WITHOUT its final CSMultiPlayMan::Stop call:
@@ -7434,7 +7500,11 @@ bool BbscRespawnInPlace(std::string_view why) {
     // nothing under the guest. The host's position is used only while the host's map is loaded
     // here; otherwise the nearest lamp of OUR map, and the follow then reloads us into the host's.
     bool partner_here = !guest;
-    if (guest) {
+    const bool revived = why == BbscRevivedWhy; // a partner revived us: up where we fell
+    if (revived) {
+        target = ReadCharacterTransform(player);
+        where = "where we fell";
+    } else if (guest) {
         s32 host_lamp = -1;
         u32 host_map = 0;
         {
@@ -7466,7 +7536,7 @@ bool BbscRespawnInPlace(std::string_view why) {
                 where = "partner";
             }
         }
-    } else {
+    } else if (!revived) {
         target = ResolveLastLampTransform();
     }
     if (!target.has_value()) {
@@ -7541,7 +7611,10 @@ bool BbscRespawnInPlace(std::string_view why) {
     const u64 stats = ReadValue<u64>(modules, 0x20);
     if (ReadablePointer(stats, 0x100)) {
         using SetHp = void PS4_SYSV_ABI (*)(u64 chr, s32 hp);
-        reinterpret_cast<SetHp>(image_base + 0x018BCD40)(player, ReadValue<s32>(stats, 0xFC));
+        // A revive by a partner gives the full HP back too (2026-10-24 19:10, the user: half was
+        // "not full life").
+        const s32 max_hp = ReadValue<s32>(stats, 0xFC);
+        reinterpret_cast<SetHp>(image_base + 0x018BCD40)(player, max_hp);
     }
     const u64 control_flags = ReadValue<u64>(control, 0x38);
     if (ReadablePointer(control_flags, 0x50)) {
@@ -7748,7 +7821,8 @@ void TickBbscHostDeathNotice() {
         last_notice_ms = now;
         LOG_INFO(Debug, "BBSC host death notice: host copy {:#x} - hp {}, dead flag {}", chr, hp,
                  dead_flag);
-        BbscAnnounce(u"The host died.\nThey will respawn at the lamp.",
+        BbscAnnounce(BbscReviveEnabled() ? u"The host has fallen."
+                                         : u"The host died.\nThey will respawn at the lamp.",
                      "host died");
     }
 }
@@ -8233,6 +8307,11 @@ bool RaiseBbscDeathText(u64 event_object, std::string_view who) {
 }
 
 void ShowBbscGuestDeathText(u64 event_object) {
+    if (BbscReviveEnabled()) {
+        // 2026-10-24, the user: no banner when the guest falls (it waits to be revived).
+        LOG_INFO(Debug, "BBSC death text: not raised for the guest (revive on)");
+        return;
+    }
     const u64 lua_event = BbscLuaEventObject();
     LOG_INFO(Debug, "BBSC death text: PartyGhostDeath event {:#x}, Lua event manager's {:#x} ({})",
              event_object, lua_event, event_object == lua_event ? "same" : "different");
@@ -8446,6 +8525,19 @@ void PS4_SYSV_ABI BbscSpectateDeathHook(u64 tag, const GuestRegisterSnapshot* re
     }
     bbsc_echoes_at_death = GetBloodEchoes();
     bbsc_kept_death_this_load = true;
+    // A kept death keeps its echoes until it is clear nobody revives the hunter (2026-10-25, the
+    // user: revived by the guest, the host had to pick its 105 echoes up off the floor).
+    // SoloPlayDeath_2 drops them unless global+0x1649 is set (0x01381F04; the step clears it after),
+    // so it is set here and the drop waits for BbscApplyDeathPenalty: at the lamp, in a wipe, or
+    // when the boss fight ends. A revive keeps them. A guest's echoes already stay through
+    // PartyGhostDeath_2 (2026-10-25 01:21:48 to 01:22:17, the guest's 108932).
+    if (tag == 0) {
+        if (const u64 global = GetGlobalState(); ReadablePointer(global, 0x1650) &&
+                                                 HasMemoryAccess(global + 0x1649, 1,
+                                                                 MemoryProt::CpuWrite)) {
+            WriteValue<u8>(global, 0x1649, 1);
+        }
+    }
     StashBbscOwnWorldSnapshot();
     bbsc_spectate_name = name;
     bbsc_spectate_since_ms = SteadyNowMs();
@@ -8458,7 +8550,9 @@ void PS4_SYSV_ABI BbscSpectateDeathHook(u64 tag, const GuestRegisterSnapshot* re
     bbsc_spectate_revivals_at_death = bbsc_peer_revivals.load();
     bbsc_boss_cleared_since_ms = 0;
     bbsc_death_mode = BbscBossFightAtDeath() || guest_waits_for_host ? BbscDeathMode::Spectate
+                      : BbscReviveEnabled()                          ? BbscDeathMode::Downed
                                                                       : BbscDeathMode::RespawnNow;
+    bbsc_revive_received = false;
     bbsc_spectate_active = true;
     if (guest_waits_for_host) {
         LOG_INFO(Debug, "BBSC death: {} with nobody alive (guest) -> wait for the host's reload, "
@@ -8470,6 +8564,8 @@ void PS4_SYSV_ABI BbscSpectateDeathHook(u64 tag, const GuestRegisterSnapshot* re
              session_state,
              bbsc_death_mode == BbscDeathMode::Spectate
                  ? "boss fight: spectate until the boss dies or nobody is alive"
+             : bbsc_death_mode == BbscDeathMode::Downed
+                 ? "no boss fight: down until revived, or the lamp on X"
                  : "no boss fight: respawn at the last lamp without a reload");
 }
 
@@ -8497,10 +8593,29 @@ void TickBbscSpectate() {
         LOG_INFO(Debug, "BBSC spectate: a partner said dead and then alive while we were down - "
                         "it reloaded after a wipe, the guest follows");
     }
-    if (session_alive && LivingPartnerExists()) {
+    // After the wipe warp the new character is up as soon as a partner says it is alive: the
+    // host's copy took about 6 s to appear in the guest's reloaded world (2026-10-24 20:21), the
+    // new character had no HP meanwhile, and the game ran its death again 6 s after the load.
+    const u64 now_chr = GetLocalPlayerCharacter();
+    const auto [peers_fresh, peers_dead] = BbscPeerLifeCounts();
+    const bool new_after_wipe = bbsc_spectate_wipe_warped && now_chr != 0 &&
+                                bbsc_spectate_chr != 0 && now_chr != bbsc_spectate_chr &&
+                                peers_fresh > peers_dead;
+    if (session_alive && (LivingPartnerExists() || new_after_wipe)) {
         std::string_view respawn_why;
-        const u64 chr = GetLocalPlayerCharacter();
-        if (bbsc_death_mode == BbscDeathMode::RespawnNow) {
+        const u64 chr = now_chr;
+        if (bbsc_revive_received.exchange(false)) {
+            // A partner revived us: up where we fell, no curtain, no death penalty.
+            if (BbscRespawnInPlace(BbscRevivedWhy)) {
+                bbsc_spectate_active = false;
+                BbscAddEffect(GetLocalPlayerCharacter(), BbscReviveGlowEffectId);
+                BbscAnnounce(u"Revived by a fellow hunter.", "revived");
+                return;
+            }
+            LOG_WARNING(Debug, "BBSC revive: getting up failed - waiting as before");
+        }
+        if (bbsc_death_mode == BbscDeathMode::RespawnNow ||
+            (bbsc_death_mode == BbscDeathMode::Downed && BbscReviveGiveUp())) {
             respawn_why = "no boss fight";
         } else if (chr != 0 && bbsc_spectate_chr != 0 && chr != bbsc_spectate_chr) {
             respawn_why = "a load ended the boss fight";
@@ -8600,8 +8715,1117 @@ void TickBbscSpectate() {
              now - bbsc_spectate_since_ms, reason);
     bbsc_spectate_active = false;
     bbsc_spectate_releasing = true;
+    BbscApplyDeathPenalty(reason); // the drop the death step left to us, before the reload
     RequestBbscDeathReload(reason);
     bbsc_spectate_releasing = false;
+}
+
+// ---- Reviving a fallen hunter (2026-10-24) ---------------------------------------------------------
+// The user: in co-op a fallen hunter waits where it fell, and another hunter revives it: stand
+// beside it and hold X (keyboard E) for 8 s. A hit stops the revive, and so do letting go and
+// walking away; what was filled stays and drains slowly, so coming back continues from there.
+// Outside a boss fight the fallen hunter can give up and go to the lamp (hold X or Circle,
+// keyboard E or G); in a boss fight it gets no choice and waits for a revive, the kill or the
+// wipe, as before. A revived hunter gets up where it fell with its full HP, and with no death
+// penalty from BBSC. The prompts are the game's own (BbscShowButtonPrompt), the progress shows in
+// both hunters' stamina. Relay "SHAD" 0x2A: u8 kind (1 down: the sender lies at map / position;
+// 2 reviving: target, percent; 3 revived: the target gets up; 4 stopped: target, percent), u32
+// sender, u32 target, u32 map, 3 x float position, u8 percent. Switch SHADPS4_BBSC_REVIVE (on).
+constexpr u8 BbscReviveType = 0x2A;
+constexpr s64 BbscReviveFillMs = 8'000; // 15 s at first; 8 s (2026-10-24 19:39, the user)
+constexpr s64 BbscReviveDrainMs = 10'000; // a full bar empties in this long while nobody fills it
+                                          // (45 s at first; faster, 2026-10-24 20:45, the user)
+constexpr float BbscReviveRange = 2.5f;   // metres between the reviver and the fallen
+constexpr s64 BbscReviveSendMs = 500;
+constexpr s64 BbscReviveFreshMs = 3'000;  // a fallen hunter heard from this recently can be revived
+// Kept, progress and all, this long without news (2026-10-24: a fallen game in the background sent
+// late and every try started from 0%); after that it got up, went to the lamp or left.
+constexpr s64 BbscReviveForgetMs = 10'000;
+constexpr s64 BbscReviveGiveUpHoldMs = 1'500;
+constexpr u32 BbscPadCross = 0x4000;
+constexpr u32 BbscPadCircle = 0x2000;
+// Anything but X stops a revive: the left stick or WASD (HeldPadButtons' moving bit), attacks,
+// the dodge, items, the lantern.
+constexpr u32 BbscPadMoving = 0x40000000;
+constexpr u32 BbscPadActions = 0x100 | 0x200 | 0x400 | 0x800 | 0x1000 | 0x2000 | 0x8000;
+
+bool BbscReviveEnabled() {
+    static const bool enabled = EnvFlagEnabled("SHADPS4_BBSC_REVIVE");
+    return enabled;
+}
+
+struct BbscFallen {
+    u32 map = 0;
+    std::array<float, 3> position{};
+    s64 received_ms = 0;
+    float progress = 0.0f; // 0..1, kept between tries
+};
+std::mutex bbsc_revive_mutex;
+std::map<u32, BbscFallen> bbsc_fallen; // relay player id -> a fallen hunter of our session
+std::atomic<int> bbsc_revive_seen_percent{-1}; // we are down: the last progress a reviver sent
+std::atomic<s64> bbsc_revive_seen_ms{0};       // ... and when it came
+
+void SendBbscRevivePacket(u8 kind, u32 target, u32 map, const std::array<float, 3>& position,
+                          u8 percent) {
+    std::array<u8, 31> packet{'S', 'H', 'A', 'D', BbscReviveType, kind};
+    const u32 self = bbsc_life_own_id.load();
+    std::memcpy(packet.data() + 6, &self, 4);
+    std::memcpy(packet.data() + 10, &target, 4);
+    std::memcpy(packet.data() + 14, &map, 4);
+    std::memcpy(packet.data() + 18, position.data(), 12);
+    packet[30] = percent;
+    Libraries::Np::NpSignaling::Helpers::SendBbscWorldFlagsToPeers(packet.data(),
+                                                                    static_cast<u32>(packet.size()));
+}
+
+// Relay thread (OnBbscRevivePacket).
+void BbscReviveRelayPacket(std::uint8_t kind, std::uint32_t player, std::uint32_t target,
+                           std::uint32_t map, float x, float y, float z, std::uint8_t percent) {
+    const u32 self = bbsc_life_own_id.load();
+    if (player == self || !BbscReviveEnabled()) {
+        return;
+    }
+    if (kind == 1) {
+        std::scoped_lock lock{bbsc_revive_mutex};
+        BbscFallen& fallen = bbsc_fallen[player];
+        fallen.map = map;
+        fallen.position = {x, y, z};
+        fallen.received_ms = SteadyNowMs();
+    } else if (kind == 2 && target == self) {
+        bbsc_revive_seen_percent = percent;
+        bbsc_revive_seen_ms = SteadyNowMs();
+    } else if (kind == 4 && target == self) {
+        bbsc_revive_seen_percent = percent; // stopped there: the bar drains from it now
+        bbsc_revive_seen_ms = 0;
+    } else if (kind == 3 && target == self) {
+        bbsc_revive_received = true;
+    }
+}
+
+// The fallen hunter's choice, outside a boss fight: X held for a moment, the button of the "Return
+// to Lamp" prompt TickBbscRevive shows (Circle too, the first choice).
+bool BbscReviveGiveUp() {
+    static s64 held_since_ms = 0;
+    const s64 now = SteadyNowMs();
+    if ((Bbsc::HeldPadButtons() & (BbscPadCircle | BbscPadCross)) == 0) {
+        held_since_ms = 0;
+        return false;
+    }
+    if (held_since_ms == 0) {
+        held_since_ms = now;
+    }
+    if (now - held_since_ms < BbscReviveGiveUpHoldMs) {
+        return false;
+    }
+    held_since_ms = 0;
+    LOG_INFO(Debug, "BBSC revive: the fallen hunter chose the lamp");
+    BBSC_TIMELINE("DEATH", "revive: the fallen hunter chose the lamp");
+    return true;
+}
+
+// A fallen hunter's copy fades out with its death; while it waits to be revived it is drawn again
+// where it lies, so the others can find it (2026-10-24, the user: "dead player has no body"). The
+// remote copy nearest to the spot it reported (within 3 m) gets the visibility of
+// TickBbscRemoteRevive: opacity chr+0x208 back to 1 and drawing on.
+// The look of a revive (2026-10-24, the user: "missing animation, like kneeling with effect"): the
+// reviver kneels with the messenger note's animation (event W_UseItemMessage, played again while it
+// holds X), the fallen body glows with the Blood Vial's effect (SpEffect 3010), and so does the
+// hunter who gets up. Events play through 0x01A19F60(behaviour, name), as Idle_wild does in
+// BbscRespawnInPlace; effects through the character's own add, vtable +0x3F0 (see "Invasions").
+// Animations by number: events like W_UseItemMessage or W_Dead_Normal00_Idle are sent and ignored
+// (2026-10-24 logs). The game's own code fires only Idle_wild and W_AnimeTest - its debug
+// animation test, CONFIRMED statically: the behaviour command dispatcher 0x01A1BA90(behaviour,
+// command, kind) takes kind 1 when command+0x19 has bit 0x10 and behaviour+0x378 >= 0, looks up
+// the W_AnimeTest state (0x01DF15B0), builds the clip name from behaviour+0x378 (0x012E7170) and
+// plays it. The numbers are the hkx files in chr/c0000*.anibnd: gestures 104000 + 10 x the
+// gesture's text id - 800 (item/10 800..822), x5 its loop. The deaths are 024xxx: the behaviour
+// graph (c0000.anibnd c0000.hkx) names its lying states BeDead24001, BeDead24011, ... (19xxx is
+// not a death: 19001 left the body in a wrong pose, 2026-10-24 12:02).
+// The kneel is the game's own (the gestures were not: Make Contact sat, Pray did not kneel,
+// 2026-10-24 12:31 and 18:35): the Upper Cathedral Ward's "Kneel" prompt (ActionButtonParam 6005,
+// talk t250307) is followed by m25_00_00_00.emevd's 2003[18] on the player with 101263; its set is
+// 101260 down on the knee (2.0 s), 101261 kneeling (3.0 s, a loop: no cancel events), 101262 up
+// again (clip lengths from the hkaSplineCompressedAnimation headers in c0000_a00_hi.anibnd, events
+// from a00.tae). The test state replays its clip until something else plays, so the start runs
+// once and the loop takes over as it ends.
+constexpr u64 BbscAnimDispatchOffset = 0x01A1BA90;
+constexpr s32 BbscReviveKneelStartAnim = 101260; // down on one knee
+constexpr s32 BbscReviveKneelLoopAnim = 101261;  // kneeling
+constexpr s32 BbscFallenPoseAnim = 24001;        // BeDead24001: lying after a normal death
+constexpr s64 BbscReviveKneelEveryMs = 2'000;
+constexpr s64 BbscReviveGlowEveryMs = 3'000;
+
+// The animation test state has no way out of its own (2026-10-24: the reviver could not move any
+// more, even after the revive): Idle_wild, as BbscRespawnInPlace plays it, ends it.
+void BbscPlayIdle(u64 chr) {
+    const u64 modules = ReadablePointer(chr, 0x3B8) ? ReadValue<u64>(chr, 0x3B0) : 0;
+    const u64 behaviour = ReadablePointer(modules, 0x38) ? ReadValue<u64>(modules, 0x30) : 0;
+    if (ReadablePointer(behaviour, 0x388)) {
+        using PlayAnimation = void PS4_SYSV_ABI (*)(u64 behaviour, u64 name_utf16);
+        reinterpret_cast<PlayAnimation>(image_base + 0x01A19F60)(behaviour,
+                                                                 image_base + 0x04992C40);
+        LOG_INFO(Debug, "BBSC revive: back to idle on {:#x}", chr);
+    }
+}
+
+void BbscPlayAnimation(u64 chr, s32 anim) {
+    const u64 modules = ReadablePointer(chr, 0x3B8) ? ReadValue<u64>(chr, 0x3B0) : 0;
+    const u64 behaviour = ReadablePointer(modules, 0x38) ? ReadValue<u64>(modules, 0x30) : 0;
+    if (!ReadablePointer(behaviour, 0x388)) {
+        return;
+    }
+    alignas(16) static std::array<u8, 0x40> command{};
+    command[0x19] = 0x10;
+    const s32 before = ReadValue<s32>(behaviour, 0x378);
+    WriteValue<s32>(behaviour, 0x378, anim);
+    using Dispatch = void PS4_SYSV_ABI (*)(u64 behaviour, u64 command, u32 kind);
+    reinterpret_cast<Dispatch>(image_base + BbscAnimDispatchOffset)(
+        behaviour, reinterpret_cast<u64>(command.data()), 1);
+    WriteValue<s32>(behaviour, 0x378, before);
+    static std::map<s32, s64> logged_ms;
+    s64& last = logged_ms[anim];
+    if (SteadyNowMs() - last > 5'000) {
+        last = SteadyNowMs();
+        LOG_INFO(Debug, "BBSC revive: animation {} played on {:#x} (test slot was {})", anim, chr,
+                 before);
+    }
+}
+
+void BbscAddEffect(u64 chr, s32 id) {
+    const u64 vtable = ReadablePointer(chr, 8) ? ReadValue<u64>(chr, 0) : 0;
+    const u64 add = ReadablePointer(vtable, 0x3F8) ? ReadValue<u64>(vtable, 0x3F0) : 0;
+    if (!IsEbootCodeAddress(add)) {
+        return;
+    }
+    using AddSpEffect = void PS4_SYSV_ABI (*)(u64 chr, s32 id, u64 source, s32, s32, s32, float,
+                                               float, float, float, float, s32);
+    reinterpret_cast<AddSpEffect>(add)(chr, id, chr, 0, 0, 0, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0);
+}
+
+// The body stayed invisible on both screens whatever was written (2026-10-24 12:30 and 18:34): the
+// lying clips fade it. Every BeDead clip (24001, 24011, ...) opens with TAE event 193 (params 0.0,
+// 0.0) and the death fall 24000 has it from 2.67 s (1.0 -> 0.0); the event handler stores
+// lerp(start, end, t) into chr+0x208, the opacity, at 0x01A21B18 (vmovss [rax+0x208], xmm0 after
+// "cmp eax, 0xC1", CONFIRMED statically), every frame the event runs - and the test state replays
+// the clip. The hook there makes it 1.0 for the bodies listed here (our own while down, the copies
+// of fallen hunters), so they lie where they fell, seen; every other death fades as before.
+constexpr u64 BbscFadeStoreOffset = 0x01A21B18;
+std::array<std::atomic<u64>, 4> bbsc_fallen_bodies{}; // [0] our own body while down, [1..3] copies
+
+void PS4_SYSV_ABI BbscFadeStoreHook(u64, const GuestRegisterSnapshot* registers) {
+    const u64 chr = registers->rax;
+    if (chr == 0) {
+        return;
+    }
+    for (const auto& body : bbsc_fallen_bodies) {
+        if (body.load(std::memory_order_relaxed) == chr) {
+            auto* changed = const_cast<GuestRegisterSnapshot*>(registers);
+            const float visible = 1.0f;
+            std::memcpy(changed->ymm[0].data(), &visible, sizeof(visible));
+            return;
+        }
+    }
+}
+
+// The reviver could not be hit while kneeling (2026-10-24 20:31, the user): the kneel is an event
+// clip, and every event clip (101260 / 101261 / 101263 / 101264 in a00.tae) carries TAE jump
+// table events 8 and 0x36 for its whole length, which no gesture does. The jump table (event type
+// 0) is handled at 0x01A21732: esi = id - 1, then a table at 0x01A246F0; id 8 sets
+// [[chr+0x3B0]+8]+0x1BC bit 1 (0x01A22B79), id 0x36 [[chr+0x58]+0x38]+0x3E bit 0 (0x01A22DA8),
+// every frame the clip runs (CONFIRMED statically). The hook right after esi is set
+// (0x01A21749, the character at [r14+0x10]) sends those two to slot 1 (id 2), which goes
+// straight to the end, while that character is the one reviving - so a hit stops the revive.
+constexpr u64 BbscJumpTableSiteOffset = 0x01A21749;
+std::atomic<u64> bbsc_reviver_chr{0}; // the local hunter while it kneels to revive
+
+void PS4_SYSV_ABI BbscJumpTableHook(u64, const GuestRegisterSnapshot* registers) {
+    const u64 reviver = bbsc_reviver_chr.load(std::memory_order_relaxed);
+    if (reviver == 0 || !ReadablePointer(registers->r14, 0x18) ||
+        ReadValue<u64>(registers->r14, 0x10) != reviver) {
+        return;
+    }
+    const u32 index = static_cast<u32>(registers->rsi);
+    if (index == 8 - 1 || index == 0x36 - 1) {
+        auto* changed = const_cast<GuestRegisterSnapshot*>(registers);
+        changed->rsi = (changed->rsi & ~0xFFFFFFFFull) | 1; // slot 1: no effect
+    }
+}
+
+void InstallBbscFadeGuard() {
+    if (image_base == 0 || !BbscReviveEnabled()) {
+        return;
+    }
+    static constexpr std::array<u8, 8> FadeSite{0xC5, 0xFA, 0x11, 0x80, 0x08, 0x02, 0x00, 0x00};
+    if (InstallGuestCodeHook(reinterpret_cast<void*>(image_base + BbscFadeStoreOffset),
+                             std::span<const u8>{FadeSite}, 0, BbscFadeStoreHook)) {
+        LOG_INFO(Debug, "BBSC revive: fade guard on (a fallen body keeps its opacity)");
+    } else {
+        LOG_ERROR(Debug, "BBSC revive: fade guard hook failed at {:#x}", BbscFadeStoreOffset);
+    }
+    // mov r13b, [rbx+0x18]; mov rcx, [r14+0x10]
+    static constexpr std::array<u8, 8> JumpSite{0x44, 0x8A, 0x6B, 0x18, 0x49, 0x8B, 0x4E, 0x10};
+    if (InstallGuestCodeHook(reinterpret_cast<void*>(image_base + BbscJumpTableSiteOffset),
+                             std::span<const u8>{JumpSite}, 0, BbscJumpTableHook)) {
+        LOG_INFO(Debug, "BBSC revive: the kneel no longer keeps hits off the reviver");
+    } else {
+        LOG_ERROR(Debug, "BBSC revive: jump table hook failed at {:#x}", BbscJumpTableSiteOffset);
+    }
+}
+
+// The prompts, with the button's icon (2026-10-24, the user, again: "no icon"): the game's own
+// action button, as items and doors show theirs ("Pick Up Item"). The button registration
+// 0x01CD91F0(button manager [0x05540048], slot, ActionButtonParam row, off, r8, r9, xmm0, stack,
+// stack) shows the row's text and its button for the frame and is true on the frame the button
+// is pressed; CONFIRMED statically from the pickup's own call (0x012FDA58: slot 9, the item's row,
+// 0, 0, 1, 0.0, 0, 0). r9 1 skips a check of flag 10000 (0x013CC180) the pickup skips too. The
+// game uses slots 1-0x10; BBSC takes 0x20. ActionButtonParam row 1 is empty in the game (all
+// zeros, nothing refers to it): BBSC fills it like row 4200 ("Search Body") with its own text -
+// event text 10010104 "Revive Hunter" (an empty "*" slot beside "Pick Up Item") on the reviver's
+// side, 10010715 "Return to Lamp" and the free camera's keys (another) on the fallen hunter's.
+// execInvalidTime 0: the game hides a row for that long after a press, and the revive is held.
+// The prompt (menu/fe.gfx, ActionButton1) draws its one button from a clip at a fixed place, the
+// text left-aligned after it, and has no other button icons: a short text sits left of centre.
+// A dead hunter gets no prompt (2026-10-24 18:59, the fallen side): the registration refuses when
+// neither [[[chr+0x3B0]+8]+0x10] bit 0 nor [R+0x5D] bit 2 is set (0x01CD937D-0x01CD938D), and the
+// first is the character's "may act" bit - 0 on the fallen hunter, read from its running game.
+// For the fallen hunter it is set for the call only and put back right after (game thread).
+u64 BbscGameParamTable(std::string_view type);     // see "The BBSC hunter's kit"
+u64 BbscParamRow(u64 table, u32 id, size_t size); // see "The BBSC hunter's kit"
+constexpr u64 BbscButtonManagerPointer = 0x05540048;
+constexpr u64 BbscButtonRegisterOffset = 0x01CD91F0;
+// The fallen hunter's prompt is "Return to Lamp" alone, on the action button: a second prompt
+// (row 10000000, slot 0x21, "Free Camera") showed as one prompt with the game's own "L3 Switch
+// Action", and execButtonCircle 0 did not change the button's icon (2026-10-24 19:37 test). The
+// free camera starts by itself instead (the user: "no need to display free camera, and we enable
+// when dead").
+struct BbscButtonPrompt {
+    u32 slot;
+    s32 row;
+    s32 text;
+};
+constexpr BbscButtonPrompt BbscRevivePrompt{0x20, 1, 10010104}; // "Revive Hunter"
+constexpr BbscButtonPrompt BbscLampPrompt{0x20, 1, 10010715};   // "Return to Lamp"
+constexpr size_t BbscActionButtonRowSize = 0x48;
+
+// True on the frame its button is pressed.
+bool BbscShowButtonPrompt(const BbscButtonPrompt& prompt, u64 dead_chr = 0) {
+    const s32 text = prompt.text;
+    const u64 table = BbscGameParamTable("ACTIONBUTTON_PARAM_ST");
+    const u64 row = table != 0 ? BbscParamRow(table, prompt.row, BbscActionButtonRowSize) : 0;
+    const u64 manager = ReadValue<u64>(image_base + BbscButtonManagerPointer, 0);
+    if (row == 0 || !ReadablePointer(manager, 0x58)) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            LOG_WARNING(Debug, "BBSC revive: no action button row or manager - prompt not shown");
+        }
+        return false;
+    }
+    if (ReadValue<s32>(row, 0x30) != text) {
+        WriteValue<u8>(row, 0x00, 0);                  // regionType
+        WriteValue<s32>(row, 0x04, -1);                // dummyPoly1
+        WriteValue<s32>(row, 0x08, -1);                // dummyPoly2
+        WriteValue<float>(row, 0x0C, BbscReviveRange); // radius
+        WriteValue<s32>(row, 0x10, 180);               // angle
+        WriteValue<float>(row, 0x1C, 2.3f);            // height
+        WriteValue<float>(row, 0x20, -1.3f);           // baseHeightOffset
+        WriteValue<s32>(row, 0x28, 180);               // allowAngle
+        WriteValue<u8>(row, 0x2C, 0);                  // textBoxType
+        WriteValue<s32>(row, 0x30, text);              // textId
+        WriteValue<s32>(row, 0x34, -1);                // invalidFlag
+        WriteValue<s32>(row, 0x38, -1);                // grayoutFlag
+        WriteValue<s32>(row, 0x3C, 3);                 // priority
+        WriteValue<float>(row, 0x40, 0.0f);            // execInvalidTime
+        WriteValue<u8>(row, 0x44, 1);                  // execButtonCircle
+        LOG_INFO(Debug, "BBSC revive: prompt row {} now shows text {}", prompt.row, text);
+    }
+    const u64 modules = ReadablePointer(dead_chr, 0x3B8) ? ReadValue<u64>(dead_chr, 0x3B0) : 0;
+    const u64 acts = ReadablePointer(modules, 0x10) ? ReadValue<u64>(modules, 0x08) : 0;
+    const u8 act_bits = ReadablePointer(acts, 0x11) ? ReadValue<u8>(acts, 0x10) : 1;
+    if ((act_bits & 1) == 0) {
+        WriteValue<u8>(acts, 0x10, static_cast<u8>(act_bits | 1));
+    }
+    using Register = bool PS4_SYSV_ABI (*)(u64 manager, u32 slot, s32 row, u32 off, u32 r8,
+                                           u32 r9, float xmm0, u32 stack0, u32 stack1);
+    const bool pressed = reinterpret_cast<Register>(image_base + BbscButtonRegisterOffset)(
+        manager, prompt.slot, prompt.row, 0, 0, 1, 0.0f, 0, 0);
+    if ((act_bits & 1) == 0) {
+        WriteValue<u8>(acts, 0x10, act_bits);
+    }
+    return pressed;
+}
+
+// Centred prompts (2026-10-24, the user: icon and text centred). The game draws every prompt the
+// same way, CONFIRMED from menu/fe.gfx: ActionButtonTop sits at the screen's centre (952.6 of
+// 1920) and in it ActionButton1 holds Button_0 at x -276.45 and Text_0 at -237.75, the text
+// field left-aligned; the C++ never moves them (the prompt update 0x01B5773A-0x01B57B99 only sets
+// the text, "Text_0" then "Text", and the button's icon frame on "Button_0"). A short text so
+// sits left of centre. For BBSC's own prompts the pair is moved with the game's own menu position
+// call 0x01ACB8C0(object, int x, int y) (GetDisplayInfo 0xE0 / SetDisplayInfo 0xE8, x and y
+// doubles at +0x00 / +0x08, flags |= 3; the object is what the update's holders keep at +8):
+// the text right after its update set it (0x01B577BB: the text, UTF-16, in rbx; the holder at
+// rbp-0x208 is the clip "Text_0" INSIDE the Text_0 sprite, child of the ActionButton1/Text_0
+// holder r14+0x110, at 0, 0 there - its x is counted from the sprite's -237.75: the first try
+// moved the text 76 left, 2026-10-24 19:57), Button_0 just before its icon frame (0x01B5793C:
+// its holder at rbp-0x260, a child of ActionButton1 itself).
+// The width is the text field's own "textWidth", read with the menu's value interface GetMember
+// (slot 0x28: Scaleform's order, which the game's own calls confirm - 0x10 / 0x18 add and release
+// a reference, 0x58 the array size, 0x138 SetText, 0xE0 / 0xE8 the display info) on the field the
+// update just wrote (its value at rbp-0xA0: interface +0x10, type +0x18, data +0x20); if it cannot
+// be read, the widths measured off the 2026-10-24 screenshots (fe.gfx units, the 24 px font). A
+// grey prompt goes to the clip "Text_1" instead (0x01B57600-0x01B57681, holder rbp-0x158), hooked
+// the same way.
+constexpr u64 BbscPromptTextSetOffset = 0x01B577BB;
+constexpr u64 BbscPromptGreyTextSetOffset = 0x01B57681;
+constexpr u64 BbscPromptButtonSetOffset = 0x01B5793C;
+constexpr u64 BbscMenuSetPositionOffset = 0x01ACB8C0;
+constexpr s32 BbscPromptButtonX = -276; // fe.gfx: Button_0 -276.45, -11.5 (y kept as the game has it)
+constexpr s32 BbscPromptTextX = -238; // fe.gfx: the Text_0 sprite -237.75, -12.05; the text
+                                      // clip in it at 0, 0
+struct BbscCentredPrompt {
+    std::u16string_view text;
+    s32 width;
+};
+constexpr std::array<BbscCentredPrompt, 2> BbscCentredPrompts{{
+    {u"Revive Hunter", 175},
+    {u"Return to Lamp", 191},
+}};
+std::optional<s32> bbsc_prompt_button_x; // the button's place for this update, then applied
+bool bbsc_prompt_moved = false;
+
+// holder: one of the prompt update's locals, {vtable, object}.
+void BbscMenuSetPosition(u64 holder, s32 x, s32 y) {
+    const u64 object = ReadablePointer(holder, 0x10) ? ReadValue<u64>(holder, 0x08) : 0;
+    const u64 vtable = ReadablePointer(object, 8) ? ReadValue<u64>(object, 0) : 0;
+    if (!ReadablePointer(vtable, 8) || !IsEbootCodeAddress(ReadValue<u64>(vtable, 0))) {
+        return;
+    }
+    using SetPosition = void PS4_SYSV_ABI (*)(u64 object, s32 x, s32 y);
+    reinterpret_cast<SetPosition>(image_base + BbscMenuSetPositionOffset)(object, x, y);
+}
+
+// The width of the text field whose value the prompt update holds at value (a GFx value), or -1.
+s32 BbscMenuTextWidth(u64 value) {
+    if (!ReadablePointer(value, 0x28)) {
+        return -1;
+    }
+    const u64 iface = ReadValue<u64>(value, 0x10);
+    const u32 type = ReadValue<u32>(value, 0x18);
+    const u64 data = ReadValue<u64>(value, 0x20);
+    const u64 vtable = ReadablePointer(iface, 8) ? ReadValue<u64>(iface, 0) : 0;
+    if ((type & 0x8F) != 0x0A || data == 0 || !ReadablePointer(vtable, 0x30) ||
+        !IsEbootCodeAddress(ReadValue<u64>(vtable, 0x28))) {
+        return -1; // not a display object
+    }
+    alignas(16) static std::array<u8, 0x40> result{};
+    result.fill(0);
+    static constexpr char Name[] = "textWidth";
+    using GetMember = bool PS4_SYSV_ABI (*)(u64 iface, u64 data, const char* name, u64 result,
+                                            bool is_display_object);
+    if (!reinterpret_cast<GetMember>(ReadValue<u64>(vtable, 0x28))(
+            iface, data, Name, reinterpret_cast<u64>(result.data()), true)) {
+        return -1;
+    }
+    // Scaleform value types: 3 int, 4 unsigned, 5 number.
+    double width = -1.0;
+    switch (*reinterpret_cast<const u32*>(result.data() + 0x18) & 0x8F) {
+    case 3:
+        width = *reinterpret_cast<const s32*>(result.data() + 0x20);
+        break;
+    case 4:
+        width = *reinterpret_cast<const u32*>(result.data() + 0x20);
+        break;
+    case 5:
+        width = *reinterpret_cast<const double*>(result.data() + 0x20);
+        break;
+    default:
+        break;
+    }
+    return width > 0.0 && width < 2'000.0 ? static_cast<s32>(width + 0.5) : -1;
+}
+
+// The place (x, y) of a prompt part in its parent, read the way 0x01ACB8C0 reads it before it
+// writes: the object's value (its vtable +0 fills one, the value at +8: interface +0x18, type
+// +0x20, data +0x28), then GetDisplayInfo (0xE0), x and y doubles at +0x00 / +0x08; the value is
+// released (0x18) when it holds a reference, as there.
+std::optional<std::pair<double, double>> BbscMenuGetPosition(u64 holder) {
+    const u64 object = ReadablePointer(holder, 0x10) ? ReadValue<u64>(holder, 0x08) : 0;
+    const u64 vtable = ReadablePointer(object, 8) ? ReadValue<u64>(object, 0) : 0;
+    if (!ReadablePointer(vtable, 8) || !IsEbootCodeAddress(ReadValue<u64>(vtable, 0))) {
+        return std::nullopt;
+    }
+    alignas(16) static std::array<u8, 0x40> value{};
+    value.fill(0);
+    using GetValue = void PS4_SYSV_ABI (*)(u64 out, u64 object);
+    reinterpret_cast<GetValue>(ReadValue<u64>(vtable, 0))(reinterpret_cast<u64>(value.data()),
+                                                          object);
+    const u64 iface = *reinterpret_cast<const u64*>(value.data() + 0x18);
+    const u32 type = *reinterpret_cast<const u32*>(value.data() + 0x20);
+    const u64 data = *reinterpret_cast<const u64*>(value.data() + 0x28);
+    const u64 iface_vtable = ReadablePointer(iface, 8) ? ReadValue<u64>(iface, 0) : 0;
+    if (!ReadablePointer(iface_vtable, 0xF0)) {
+        return std::nullopt;
+    }
+    std::optional<std::pair<double, double>> place;
+    if ((type & 0x8F) != 0) {
+        alignas(16) static std::array<u8, 0x100> info{};
+        info.fill(0);
+        using GetDisplayInfo = bool PS4_SYSV_ABI (*)(u64 iface, u64 data, u64 info);
+        if (reinterpret_cast<GetDisplayInfo>(ReadValue<u64>(iface_vtable, 0xE0))(
+                iface, data, reinterpret_cast<u64>(info.data()))) {
+            place = std::pair{*reinterpret_cast<const double*>(info.data()),
+                              *reinterpret_cast<const double*>(info.data() + 8)};
+        }
+    }
+    if ((type & 0x40) != 0) {
+        using Release = void PS4_SYSV_ABI (*)(u64 iface, u64 value, u64 data);
+        reinterpret_cast<Release>(ReadValue<u64>(iface_vtable, 0x18))(
+            iface, reinterpret_cast<u64>(value.data() + 8), data);
+    }
+    return place;
+}
+
+// Only BBSC's own prompts are moved (2026-10-24 20:49, the user: the game's own were centred
+// before, the X on the line of "Return to the Hunter's Dream" and "L3 Switch Action" on the
+// second - putting them back to fe.gfx's places broke that). Before the first move the text's
+// and the button's places are read and kept, y is never changed, and the next other prompt gets
+// exactly those places back. A prompt with a second line ([r13+2], 0x01B5798F) is left alone.
+std::optional<std::pair<double, double>> bbsc_prompt_text_place;   // the game's, before we moved
+std::optional<std::pair<double, double>> bbsc_prompt_button_place; // the game's, before we moved
+u64 bbsc_prompt_moved_holder_offset = 0;                             // which text clip we moved
+
+// tag 0: the normal text (clip Text_0, holder rbp-0x208); 1: a grey prompt (Text_1, rbp-0x158).
+void PS4_SYSV_ABI BbscPromptTextHook(u64 tag, const GuestRegisterSnapshot* registers) {
+    const u64 text = registers->rbx;
+    bool ours = false;
+    s32 width = -1;
+    for (const BbscCentredPrompt& prompt : BbscCentredPrompts) {
+        const size_t bytes = (prompt.text.size() + 1) * sizeof(char16_t);
+        if (text != 0 && ReadablePointer(text, bytes) &&
+            std::u16string_view{reinterpret_cast<const char16_t*>(text), prompt.text.size() + 1} ==
+                std::u16string_view{prompt.text.data(), prompt.text.size() + 1}) {
+            ours = true;
+            width = prompt.width;
+        }
+    }
+    const bool two_lines = ReadablePointer(registers->r13, 3) && ReadValue<u8>(registers->r13, 2) != 0;
+    const u64 holder_offset = tag == 0 ? 0x208 : 0x158;
+    const u64 text_holder = registers->rbp - holder_offset;
+    if (!ours || two_lines) {
+        if (bbsc_prompt_moved) {
+            bbsc_prompt_moved = false;
+            if (bbsc_prompt_text_place && bbsc_prompt_moved_holder_offset == holder_offset) {
+                BbscMenuSetPosition(text_holder, static_cast<s32>(bbsc_prompt_text_place->first),
+                                    static_cast<s32>(bbsc_prompt_text_place->second));
+            }
+            if (bbsc_prompt_button_place) {
+                bbsc_prompt_button_x = static_cast<s32>(bbsc_prompt_button_place->first);
+            }
+        }
+        return;
+    }
+    if (const s32 measured = BbscMenuTextWidth(registers->rbp - 0xA0); measured > 0) {
+        width = measured;
+    }
+    if (!bbsc_prompt_moved) {
+        bbsc_prompt_text_place = BbscMenuGetPosition(text_holder);
+        bbsc_prompt_button_place.reset();
+        if (bbsc_prompt_text_place) {
+            LOG_INFO(Debug, "BBSC revive: prompt text clip at {:.1f}, {:.1f} before centring (width {})",
+                     bbsc_prompt_text_place->first, bbsc_prompt_text_place->second, width);
+        }
+    }
+    if (!bbsc_prompt_text_place) {
+        return; // its place cannot be read: nothing is moved
+    }
+    const s32 group = (BbscPromptTextX - BbscPromptButtonX) + width;
+    const s32 button_x = -group / 2;
+    // Where the text starts, as an offset from its sprite's own place; y as the game had it.
+    BbscMenuSetPosition(text_holder,
+                        button_x + (BbscPromptTextX - BbscPromptButtonX) - BbscPromptTextX,
+                        static_cast<s32>(bbsc_prompt_text_place->second));
+    bbsc_prompt_button_x = button_x;
+    bbsc_prompt_moved = true;
+    bbsc_prompt_moved_holder_offset = holder_offset;
+}
+
+void PS4_SYSV_ABI BbscPromptButtonHook(u64, const GuestRegisterSnapshot* registers) {
+    const auto x = std::exchange(bbsc_prompt_button_x, std::nullopt);
+    if (!x) {
+        return;
+    }
+    const u64 holder = registers->rbp - 0x260;
+    if (!bbsc_prompt_button_place) {
+        bbsc_prompt_button_place = BbscMenuGetPosition(holder);
+        if (bbsc_prompt_button_place) {
+            LOG_INFO(Debug, "BBSC revive: prompt button at {:.1f}, {:.1f} before centring",
+                     bbsc_prompt_button_place->first, bbsc_prompt_button_place->second);
+        }
+    }
+    if (bbsc_prompt_button_place) {
+        BbscMenuSetPosition(holder, *x, static_cast<s32>(bbsc_prompt_button_place->second));
+    }
+}
+
+void InstallBbscPromptCentring() {
+    if (image_base == 0 || !BbscReviveEnabled()) {
+        return;
+    }
+    // 0x01B577BB: mov eax, [rbp-0x88]; 0x01B5793C: lea rdi, [rbp-0x260]
+    static constexpr std::array<u8, 6> TextSite{0x8B, 0x85, 0x78, 0xFF, 0xFF, 0xFF};
+    static constexpr std::array<u8, 7> ButtonSite{0x48, 0x8D, 0xBD, 0xA0, 0xFD, 0xFF, 0xFF};
+    const bool text = InstallGuestCodeHook(
+        reinterpret_cast<void*>(image_base + BbscPromptTextSetOffset), std::span<const u8>{TextSite},
+        0, BbscPromptTextHook);
+    // 0x01B57681: the same mov eax, [rbp-0x88], after the grey text's SetText
+    const bool grey = InstallGuestCodeHook(
+        reinterpret_cast<void*>(image_base + BbscPromptGreyTextSetOffset),
+        std::span<const u8>{TextSite}, 1, BbscPromptTextHook);
+    const bool button = InstallGuestCodeHook(
+        reinterpret_cast<void*>(image_base + BbscPromptButtonSetOffset),
+        std::span<const u8>{ButtonSite}, 0, BbscPromptButtonHook);
+    LOG_INFO(Debug, "BBSC revive: prompt centring text={} grey={} button={}", text, grey, button);
+}
+
+// The bar (2026-10-24, the user: "use the stamina to show a progress bar"): the fallen hunter's
+// stamina is the progress, 0 up to full, and drains back as the progress does; the reviver must
+// start with full stamina and spends it as the revive goes. Stamina is [[chr+0x3B0]+0x20]+0x134,
+// its maximum +0x138 (next to HP +0xF8 / max +0xFC, read through the same data module): a level
+// 150-ish hunter read 156 / 156 with base 136 there (2026-10-24 18:36 memory dump), and Bloodborne's
+// stamina never goes above 170 - the 207 at +0x128 is something else.
+std::optional<std::pair<s32, s32>> BbscStamina(u64 chr) {
+    const u64 modules = ReadablePointer(chr, 0x3B8) ? ReadValue<u64>(chr, 0x3B0) : 0;
+    const u64 data = ReadablePointer(modules, 0x28) ? ReadValue<u64>(modules, 0x20) : 0;
+    if (!ReadablePointer(data, 0x13C)) {
+        return std::nullopt;
+    }
+    return std::pair{ReadValue<s32>(data, 0x134), ReadValue<s32>(data, 0x138)};
+}
+
+void BbscSetStamina(u64 chr, float fraction) {
+    const auto stamina = BbscStamina(chr);
+    if (!stamina.has_value() || stamina->second <= 0 || stamina->second > 1000) {
+        return;
+    }
+    const u64 data = ReadValue<u64>(ReadValue<u64>(chr, 0x3B0), 0x20);
+    WriteValue<s32>(data, 0x134, static_cast<s32>(std::clamp(fraction, 0.0f, 1.0f) *
+                                                  static_cast<float>(stamina->second)));
+}
+
+// Fallen player -> its copy that got the physics reset for this fall (cleared when it gets up).
+std::map<u32, u64> bbsc_fallen_reset;
+
+// Is chr still one of the world's characters? A copy BBSC keeps a pointer to can be freed by a
+// load (2026-10-24 20:05: the host rested at a lamp while the guest was down and crashed in the
+// load).
+bool BbscCharacterInWorld(u64 chr) {
+    const u64 world_chr = ReadValue<u64>(image_base + CandidateLocalStatePointerOffset, 0);
+    if (chr == 0 || !ReadablePointer(world_chr, 0x70)) {
+        return false;
+    }
+    const s32 count = ReadValue<s32>(world_chr, 0x30);
+    const u64 entries = ReadValue<u64>(world_chr, 0x38);
+    if (count <= 0 || count > 64 || !ReadablePointer(entries, static_cast<size_t>(count) * 0x38)) {
+        return false;
+    }
+    for (s32 i = 0; i < count; ++i) {
+        if (ReadValue<u64>(entries, static_cast<size_t>(i) * 0x38) == chr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+u64 ShowBbscFallenCopy(u32 id, const std::array<float, 3>& at) {
+    static std::vector<u32> logged;
+    const u64 world_chr = ReadValue<u64>(image_base + CandidateLocalStatePointerOffset, 0);
+    if (!ReadablePointer(world_chr, 0x70)) {
+        return 0;
+    }
+    const u64 local = ReadValue<u64>(world_chr, 0x60);
+    const s32 count = ReadValue<s32>(world_chr, 0x30);
+    const u64 entries = ReadValue<u64>(world_chr, 0x38);
+    if (count <= 0 || count > 64 || !ReadablePointer(entries, static_cast<size_t>(count) * 0x38)) {
+        return 0;
+    }
+    u64 best = 0;
+    float best_d = 9.0f;
+    for (s32 i = 0; i < count; ++i) {
+        const u64 chr = ReadValue<u64>(entries, static_cast<size_t>(i) * 0x38);
+        if (chr == 0 || chr == local || !ReadablePointer(chr, 0x410) ||
+            IsInvaderType(GetCharacterType(chr))) {
+            continue;
+        }
+        if (const auto t = ReadCharacterTransform(chr)) {
+            float d = 0.0f;
+            for (size_t k = 0; k < 3; ++k) {
+                const float delta = t->position[k] - at[k];
+                d += delta * delta;
+            }
+            if (d < best_d) {
+                best_d = d;
+                best = chr;
+            }
+        }
+    }
+    if (best == 0) {
+        if (std::ranges::find(logged, id) == logged.end()) {
+            logged.push_back(id);
+            LOG_INFO(Debug, "BBSC revive: no copy of fallen player {:08x} within 3 m of where it lies",
+                     id);
+        }
+        return 0;
+    }
+    const u64 modules = ReadValue<u64>(best, 0x3B0);
+    const u64 draw = ReadablePointer(modules, 0x60) ? ReadValue<u64>(modules, 0x58) : 0;
+    const u64 draw_state = ReadablePointer(draw, 0x30) ? ReadValue<u64>(draw, 0x28) : 0;
+    const float opacity = ReadValue<float>(best, 0x208);
+    const int drawing = ReadablePointer(draw_state, 0x10) ? ReadValue<u8>(draw_state, 0x0C) : -1;
+    // The death flags hide the body too, only the name stayed (2026-10-24 11:24, screenshot): the
+    // same ones TickBbscRemoteRevive clears, [[chr+0x58]+0x38]+0x48 bits 0-1 and [chr+0x58]+0x114
+    // bit 0. No Idle_wild here: the body keeps lying as it fell. Both death flags stay set now:
+    // with them cleared the boss went on attacking the fallen hunter's body (2026-10-24 20:20,
+    // the user; +0x114 kept alone, 20:30, was not enough), and the fade hook keeps the body seen.
+    const u64 control = ReadablePointer(best, 0x60) ? ReadValue<u64>(best, 0x58) : 0;
+    const u64 control_flags = ReadablePointer(control, 0x40) ? ReadValue<u64>(control, 0x38) : 0;
+    const int flags48 = ReadablePointer(control_flags, 0x50) ? ReadValue<u8>(control_flags, 0x48) : -1;
+    const int dead114 = ReadablePointer(control, 0x118) ? ReadValue<u16>(control, 0x114) : -1;
+    // The phantom's death breaks the body into shards (2026-10-24 11:32, screenshot): flags and
+    // opacity alone did not bring it back. TickBbscRemoteRevive does, with a physics reset and
+    // Idle_wild first, so the same steps run once per fall - the body then stands where it fell.
+    // Without that reset the body stayed gone, lying or not (2026-10-24 12:30, both screens): it
+    // runs once per copy and fall, before the first lying pose.
+    if (bbsc_fallen_reset[id] != best) {
+        bbsc_fallen_reset[id] = best;
+        using PhysicsReset = void PS4_SYSV_ABI (*)(u64 chr, u8 flag);
+        reinterpret_cast<PhysicsReset>(image_base + 0x018BCF30)(best, 1);
+        LOG_INFO(Debug, "BBSC revive: fallen player {:08x}'s copy {:#x} reset where it lies", id,
+                 best);
+    }
+    // Lying here too: the animation test is not sent to the others, so the copy stood while its
+    // owner lay (2026-10-24 12:12, screenshot). Every 2 s; TickBbscRevive puts it back to idle once
+    // the fallen hunter got up (the test state has no way out of its own).
+    static std::map<u32, s64> laid_ms;
+    if (SteadyNowMs() - laid_ms[id] >= 2'000) {
+        laid_ms[id] = SteadyNowMs();
+        BbscPlayAnimation(best, BbscFallenPoseAnim);
+    }
+    if (opacity < 0.99f) {
+        WriteValue<u64>(best, 0x208, 0x3F8000003F800000ull);
+    }
+    if (drawing == 0) {
+        WriteValue<u8>(draw_state, 0x0C, 1);
+    }
+    // A repeat death (the one BBSC raises itself, see TickBbscDeadWatchdog) sets neither death
+    // flag on the copy: it read +0x48 0, +0x114 0 with 0 HP, and the boss went on attacking it
+    // (2026-10-24 20:32). The game's own death sets both bit 0s (20:29: +0x48 0x1, +0x114 0x1,
+    // the body seen); a copy that lies here gets them the same way.
+    if (flags48 >= 0 && (flags48 & 1) == 0) {
+        WriteValue<u8>(control_flags, 0x48, static_cast<u8>(flags48 | 1));
+    }
+    if (dead114 >= 0 && (dead114 & 1) == 0) {
+        WriteValue<u16>(control, 0x114, static_cast<u16>(dead114 | 1));
+    }
+    const bool changed = opacity < 0.99f || drawing == 0;
+    if (changed && std::ranges::find(logged, id) == logged.end()) {
+        logged.push_back(id);
+        LOG_INFO(Debug, "BBSC revive: fallen player {:08x} drawn again where it lies (opacity {:.2f}, "
+                        "drawing {}, flags +0x48 {:#x}, +0x114 {:#x})",
+                 id, opacity, drawing, flags48, dead114);
+    }
+    return best;
+}
+
+void TickBbscRevive() {
+    static s64 last_ms = 0;
+    static s64 sent_ms = 0;
+    static bool was_down = false;
+    static int seen_percent = -1;
+    static u32 near_id = 0;
+    static s64 prompted_ms = 0;
+    static s32 last_hp = -1;
+    static bool blocked = false;   // hit while reviving: until X is let go
+    static bool filling = false;
+    static s64 progress_sent_ms = 0;
+    const s64 now = SteadyNowMs();
+    const s64 step = last_ms == 0 ? 0 : std::min<s64>(now - last_ms, 250);
+    last_ms = now;
+    static std::map<u32, u64> copies; // fallen player -> its copy here, from the last look
+    static std::map<u32, u64> posed;  // copies laid down here, put back to idle when they get up
+    const s32 state = GetSessionState();
+    const u64 global = GetGlobalState();
+    const bool loading = !ReadablePointer(global, 0x10) || ReadValue<u8>(global, 0x08) != 0;
+    if (loading) {
+        // Nothing during a load: the characters BBSC poses can be freed under it (20:05 crash,
+        // the host resting at a lamp with the guest down). The copies are looked up again after.
+        copies.clear();
+        posed.clear();
+        bbsc_fallen_reset.clear();
+        for (auto& body : bbsc_fallen_bodies) {
+            body = 0;
+        }
+        filling = false;
+        return;
+    }
+    if (!BbscReviveEnabled() || image_base == 0 || (state != 3 && state != 6)) {
+        std::scoped_lock lock{bbsc_revive_mutex};
+        bbsc_fallen.clear();
+        was_down = false;
+        near_id = 0;
+        filling = false;
+        copies.clear();
+        posed.clear();
+        bbsc_fallen_reset.clear();
+        for (auto& body : bbsc_fallen_bodies) {
+            body = 0;
+        }
+        return;
+    }
+    const u64 me = GetLocalPlayerCharacter();
+    const auto body = me != 0 ? ReadCharacterTransform(me) : std::nullopt;
+    const u32 map = GetCurrentPackedMap();
+
+    // Down: tell the others where we lie (a dead body does not move).
+    const bool down = bbsc_spectate_active && !bbsc_spectate_saw_wipe &&
+                      (bbsc_death_mode == BbscDeathMode::Downed ||
+                       bbsc_death_mode == BbscDeathMode::Spectate);
+    if (down != was_down) {
+        was_down = down;
+        seen_percent = -1;
+        bbsc_revive_seen_percent = -1;
+        if (down) {
+            const bool choice = bbsc_death_mode == BbscDeathMode::Downed;
+            LOG_INFO(Debug, "BBSC revive: we are down ({}) - waiting for a fellow hunter",
+                     choice ? "the lamp on X" : "boss fight, no choice");
+            bbsc_free_camera_on_down = choice;
+            BBSC_TIMELINE("DEATH", "revive: down, waiting for a fellow hunter ({})",
+                          choice ? "lamp on X" : "boss fight");
+        }
+    }
+    static u64 reset_me = 0;
+    static float bar = 0.0f; // down: the progress shown in our stamina
+    if (!down) {
+        reset_me = 0;
+        bar = 0.0f;
+        bbsc_fallen_bodies[0] = 0;
+    }
+    if (down) {
+        bbsc_fallen_bodies[0] = me;
+        // Fell in a boss fight and the fight is over without a kill (a wipe that did not take, a
+        // fog left behind): the normal choice of the lamp, with its prompt (2026-10-24, the user:
+        // "as a fallback he should have the prompt"). A kill still gets everyone up as before.
+        static s64 no_boss_since_ms = 0;
+        // The same rule that made it a boss-fight death (BbscBossFightAtDeath: the bar, a bar
+        // moments ago with no kill since, and whatever else it counts) says when the fight is over.
+        if (bbsc_death_mode == BbscDeathMode::Spectate && !BbscBossFightAtDeath() &&
+            bbsc_boss_killed_ms < bbsc_spectate_since_ms) {
+            if (no_boss_since_ms == 0) {
+                no_boss_since_ms = now;
+            } else if (now - no_boss_since_ms >= 5'000) {
+                bbsc_death_mode = BbscDeathMode::Downed;
+                bbsc_free_camera_on_down = true;
+                no_boss_since_ms = 0;
+                LOG_INFO(Debug, "BBSC revive: the boss fight is over - down with the lamp's choice");
+                BBSC_TIMELINE("DEATH", "revive: the boss fight is over - down with the lamp's choice");
+            }
+        } else {
+            no_boss_since_ms = 0;
+        }
+        if (bbsc_death_mode == BbscDeathMode::Downed) {
+            BbscShowButtonPrompt(BbscLampPrompt, me);
+        }
+        // The bar: the reviver's last word while it fills (four a second), carried on at the
+        // fill rate from there, so it mirrors the reviver's own bar (2026-10-24, the user: "both
+        // stamina bars are not fully in sync"); from where it stopped (kind 4), drained at the
+        // reviver's drain rate.
+        const int heard = bbsc_revive_seen_percent.load();
+        const s64 heard_ms = bbsc_revive_seen_ms.load();
+        if (heard >= 0 && heard_ms != 0 && now - heard_ms < 750) {
+            bar = std::min(static_cast<float>(heard) / 100.0f +
+                               static_cast<float>(now - heard_ms) / BbscReviveFillMs,
+                           1.0f);
+        } else {
+            if (heard >= 0 && heard_ms == 0) {
+                bar = std::min(bar, static_cast<float>(heard) / 100.0f); // where it stopped
+            }
+            bar = std::max(0.0f, bar - static_cast<float>(step) / BbscReviveDrainMs);
+        }
+        if (me != 0) {
+            BbscSetStamina(me, bar);
+        }
+        // Our own body stayed gone with opacity and drawing alone (2026-10-24 12:30): the same
+        // physics reset the copies get, once per fall, before the lying pose.
+        if (me != 0 && reset_me != me && ReadablePointer(me, 0x3B8)) {
+            reset_me = me;
+            using PhysicsReset = void PS4_SYSV_ABI (*)(u64 chr, u8 flag);
+            reinterpret_cast<PhysicsReset>(image_base + 0x018BCF30)(me, 1);
+            LOG_INFO(Debug, "BBSC revive: our own body {:#x} reset where it lies", me);
+        }
+        // A phantom's death breaks the body into shards on the others' screens, and their copy
+        // follows our animation: lying in the normal death pose instead, the body stays.
+        static s64 posed_ms = 0;
+        if (me != 0 && now - posed_ms >= 2'000) {
+            posed_ms = now;
+            BbscPlayAnimation(me, BbscFallenPoseAnim);
+        }
+        // Our own body is gone from our own screen too (2026-10-24 12:12): drawn again, as the
+        // others' copies are. The death flags stay: we are dead.
+        if (me != 0 && ReadablePointer(me, 0x3B8)) {
+            const u64 own_modules = ReadValue<u64>(me, 0x3B0);
+            const u64 own_draw =
+                ReadablePointer(own_modules, 0x60) ? ReadValue<u64>(own_modules, 0x58) : 0;
+            const u64 own_state = ReadablePointer(own_draw, 0x30) ? ReadValue<u64>(own_draw, 0x28) : 0;
+            if (ReadValue<float>(me, 0x208) < 0.99f) {
+                WriteValue<u64>(me, 0x208, 0x3F8000003F800000ull);
+            }
+            if (ReadablePointer(own_state, 0x10) && ReadValue<u8>(own_state, 0x0C) == 0) {
+                WriteValue<u8>(own_state, 0x0C, 1);
+            }
+            // A repeat death (raised by BBSC, see TickBbscDeadWatchdog) sets neither death flag,
+            // and the enemies went on attacking the fallen hunter (2026-10-24 23:40, the user):
+            // both bit 0s, as the game's own death sets them (BbscRespawnInPlace clears them).
+            const u64 own_control = ReadablePointer(me, 0x60) ? ReadValue<u64>(me, 0x58) : 0;
+            const u64 own_flags =
+                ReadablePointer(own_control, 0x40) ? ReadValue<u64>(own_control, 0x38) : 0;
+            if (ReadablePointer(own_flags, 0x50) && (ReadValue<u8>(own_flags, 0x48) & 1) == 0) {
+                WriteValue<u8>(own_flags, 0x48, static_cast<u8>(ReadValue<u8>(own_flags, 0x48) | 1));
+            }
+            if (ReadablePointer(own_control, 0x118) && (ReadValue<u16>(own_control, 0x114) & 1) == 0) {
+                WriteValue<u16>(own_control, 0x114,
+                                static_cast<u16>(ReadValue<u16>(own_control, 0x114) | 1));
+            }
+        }
+        if (body.has_value() && now - sent_ms >= BbscReviveSendMs) {
+            sent_ms = now;
+            SendBbscRevivePacket(1, 0, map, {body->position[0], body->position[1], body->position[2]}, 0);
+        }
+        const int percent = bbsc_revive_seen_percent.load();
+        if (percent >= 0 && seen_percent < 0) {
+            BbscAnnounce(u"A fellow hunter is reviving you...", "being revived");
+        }
+        seen_percent = percent;
+        return;
+    }
+
+    // Alive: a fallen hunter beside us?
+    const s32 hp = me != 0 ? GetCharacterHp(me) : -1;
+    const bool hit = last_hp > 0 && hp >= 0 && hp < last_hp;
+    last_hp = hp;
+    const u32 pad = Bbsc::HeldPadButtons();
+    const bool held = (pad & BbscPadCross) != 0;
+    if (!held) {
+        blocked = false;
+    }
+    // Moving or any other action stops it like a hit. Not by distance: the kneel holds the
+    // hunter in place and the stick only turned it (2026-10-24 12:31).
+    const bool acting = (pad & (BbscPadMoving | BbscPadActions)) != 0;
+    // Stamina to start (2026-10-24, the user): what the mirrored bar needs (1 - progress), so a
+    // fresh revive needs it full and a resumed one only its share - 2% spare, as the bar shows
+    // full a point or two under the maximum ("catch your breath" came with the bar full, 19:28).
+    // Then the bar empties as the revive goes.
+    const auto stamina = me != 0 ? BbscStamina(me) : std::nullopt;
+    float last_progress = 0.0f;
+    {
+        std::scoped_lock lock{bbsc_revive_mutex};
+        if (const auto it = bbsc_fallen.find(near_id); it != bbsc_fallen.end()) {
+            last_progress = it->second.progress;
+        }
+    }
+    const float stamina_needed = std::max(0.0f, 1.0f - last_progress - 0.02f);
+    const bool rested = !stamina.has_value() || stamina->second <= 0 ||
+                        static_cast<float>(stamina->first) >=
+                            stamina_needed * static_cast<float>(stamina->second);
+    // A stop that was not ours (the fallen hunter's news came late) picks up again without
+    // the full stamina for a moment (2026-10-24 19:09: three stops with no reason logged, each
+    // asking to catch the breath though the reviver held still).
+    static s64 soft_stop_ms = 0;
+    const bool resuming = soft_stop_ms != 0 && now - soft_stop_ms < 2'000;
+    const bool may_fill = held && !blocked && !hit && !acting && (filling || rested || resuming);
+    u32 target = 0;
+    float progress = 0.0f;
+    std::array<float, 3> target_position{};
+    std::vector<std::pair<u32, std::array<float, 3>>> lying;
+    {
+        std::scoped_lock lock{bbsc_revive_mutex};
+        float best = BbscReviveRange * BbscReviveRange;
+        for (auto it = bbsc_fallen.begin(); it != bbsc_fallen.end();) {
+            BbscFallen& fallen = it->second;
+            if (now - fallen.received_ms > BbscReviveForgetMs) {
+                it = bbsc_fallen.erase(it); // got up, went to the lamp, or left
+                continue;
+            }
+            // The one being revived stays the target while it was heard from at all lately: a
+            // fallen game in the background sends late.
+            const s64 fresh =
+                filling && it->first == near_id ? BbscReviveForgetMs : BbscReviveFreshMs;
+            if (body.has_value() && hp > 0 && fallen.map == map &&
+                now - fallen.received_ms <= fresh) {
+                float d = 0.0f;
+                for (size_t i = 0; i < 3; ++i) {
+                    const float delta = fallen.position[i] - body->position[i];
+                    d += delta * delta;
+                }
+                if (d <= best) {
+                    best = d;
+                    target = it->first;
+                }
+            }
+            ++it;
+        }
+        for (auto& [id, fallen] : bbsc_fallen) {
+            const bool fill = id == target && may_fill;
+            if (fill) {
+                fallen.progress += static_cast<float>(step) / BbscReviveFillMs;
+            } else {
+                fallen.progress = std::max(0.0f, fallen.progress -
+                                                     static_cast<float>(step) / BbscReviveDrainMs);
+            }
+            if (id == target) {
+                progress = fallen.progress;
+                target_position = fallen.position;
+            }
+        }
+        if (target != 0 && progress >= 1.0f) {
+            bbsc_fallen.erase(target);
+        }
+        for (const auto& [id, fallen] : bbsc_fallen) {
+            if (fallen.map == map && now - fallen.received_ms <= BbscReviveFreshMs) {
+                lying.emplace_back(id, fallen.position);
+            }
+        }
+    }
+    static s64 shown_ms = 0;
+    if (now - shown_ms >= 100) {
+        shown_ms = now;
+        copies.clear();
+        for (const auto& [id, at] : lying) {
+            if (const u64 copy = ShowBbscFallenCopy(id, at)) {
+                copies[id] = copy;
+                posed[id] = copy;
+            }
+        }
+        size_t slot = 1;
+        for (const auto& [id, copy] : copies) {
+            if (slot < bbsc_fallen_bodies.size()) {
+                bbsc_fallen_bodies[slot++] = copy;
+            }
+        }
+        for (; slot < bbsc_fallen_bodies.size(); ++slot) {
+            bbsc_fallen_bodies[slot] = 0;
+        }
+        for (auto it = posed.begin(); it != posed.end();) {
+            if (copies.contains(it->first)) {
+                ++it;
+                continue;
+            }
+            if (BbscCharacterInWorld(it->second)) {
+                BbscPlayIdle(it->second); // up again (revived, at the lamp); a gone one is left
+            }
+            bbsc_fallen_reset.erase(it->first);
+            it = posed.erase(it);
+        }
+    }
+    if (target != near_id) {
+        near_id = target;
+        if (target != 0 && now - prompted_ms > 10'000) {
+            prompted_ms = now;
+            // The button is the game's own prompt now, beside the body (BbscShowButtonPrompt).
+            BbscAnnounce(u"A fellow hunter has fallen.", "revive prompt");
+        }
+    }
+    if (hit && filling) {
+        blocked = true;
+        LOG_INFO(Debug, "BBSC revive: interrupted by a hit at {}%", static_cast<int>(progress * 100));
+        BbscAnnounce(u"Revival interrupted.", "revive interrupted");
+    }
+    if (filling && acting) {
+        blocked = true;
+        LOG_INFO(Debug, "BBSC revive: moved or acted while reviving (pad {:#x}) - stopped at {}%",
+                 pad, static_cast<int>(progress * 100));
+        BbscAnnounce(u"Revival interrupted.", "revive interrupted");
+    }
+    const bool now_filling = target != 0 && may_fill && progress < 1.0f;
+    if (target != 0 && !now_filling && progress < 1.0f) {
+        BbscShowButtonPrompt(BbscRevivePrompt);
+        static s64 breath_ms = 0;
+        if (held && !rested && !filling && !resuming && !blocked && !acting &&
+            now - breath_ms > 5'000) {
+            breath_ms = now;
+            BbscAnnounce(u"Catch your breath first.", "revive needs stamina");
+            if (stamina.has_value()) {
+                LOG_INFO(Debug, "BBSC revive: stamina {} of {}, {}% needed (progress {}%)",
+                         stamina->first, stamina->second,
+                         static_cast<int>(stamina_needed * 100.0f),
+                         static_cast<int>(last_progress * 100.0f));
+            }
+        }
+    }
+    if (now_filling) {
+        BbscSetStamina(me, 1.0f - progress); // the fallen hunter's bar, mirrored
+    }
+    if (now_filling && !filling) {
+        LOG_INFO(Debug, "BBSC revive: reviving player {:08x} from {}%", target,
+                 static_cast<int>(progress * 100));
+        BbscAnnounce(u"Reviving the fallen hunter...", "reviving");
+    }
+    if (filling && !now_filling && progress < 1.0f) {
+        const bool ours = !held || acting || hit || blocked;
+        soft_stop_ms = ours ? 0 : now;
+        LOG_INFO(Debug, "BBSC revive: stopped at {}% ({})", static_cast<int>(progress * 100),
+                 !held    ? "X let go"
+                 : ours   ? "moved, acted or hit"
+                 : target == 0 ? "the fallen hunter is out of reach or not heard from"
+                               : "other");
+        if (target != 0) {
+            SendBbscRevivePacket(4, target, map, target_position,
+                                 static_cast<u8>(std::clamp(progress * 100.0f, 0.0f, 100.0f)));
+        }
+    }
+    if (now_filling) {
+        soft_stop_ms = 0;
+    }
+    filling = now_filling;
+    bbsc_reviver_chr = filling ? me : 0;
+    static s64 kneel_ms = 0;
+    static s64 glow_ms = 0;
+    if (filling) {
+        static bool kneel_held = false;
+        if (kneel_ms == 0) {
+            BbscPlayAnimation(me, BbscReviveKneelStartAnim);
+            kneel_ms = now;
+            kneel_held = false;
+        } else if (!kneel_held && now - kneel_ms >= BbscReviveKneelEveryMs) {
+            BbscPlayAnimation(me, BbscReviveKneelLoopAnim); // once: replays showed as a loop
+            kneel_held = true;
+        }
+        if (now - glow_ms >= BbscReviveGlowEveryMs) {
+            glow_ms = now;
+            if (const auto it = copies.find(target); it != copies.end()) {
+                BbscAddEffect(it->second, BbscReviveGlowEffectId);
+            }
+        }
+    } else {
+        if (kneel_ms != 0 && me != 0) {
+            BbscPlayIdle(me); // done, let go or hit: up again
+        }
+        kneel_ms = 0;
+        glow_ms = 0;
+    }
+    if (filling && now - progress_sent_ms >= 250) {
+        progress_sent_ms = now;
+        SendBbscRevivePacket(2, target, map, target_position,
+                             static_cast<u8>(std::clamp(progress * 100.0f, 0.0f, 100.0f)));
+    }
+    if (target != 0 && progress >= 1.0f) {
+        for (int i = 0; i < 3; ++i) {
+            SendBbscRevivePacket(3, target, map, target_position, 100); // the relay may drop one
+        }
+        filling = false;
+        near_id = 0;
+        LOG_INFO(Debug, "BBSC revive: player {:08x} revived", target);
+        BBSC_TIMELINE("DEATH", "revive: we revived player {:08x}", target);
+        BbscAnnounce(u"The fallen hunter is back on its feet.", "revive done");
+    }
 }
 
 // Boss kill keeps the co-op (CONFIRMED statically, 2026-09-16). The boss clear Lua chain is
@@ -11605,7 +12829,7 @@ struct BbscWatchState {
 };
 BbscWatchState bbsc_watch;
 constexpr float BbscWatchHeadHeight = 1.4f; // metres above the feet
-std::array<char16_t, 160> bbsc_watch_notice{}; // stays valid while the banner shows it
+std::array<char16_t, 256> bbsc_watch_notice{}; // stays valid while the banner shows it
 
 std::vector<u64> BbscWatchTargets() {
     std::vector<u64> out;
@@ -11614,6 +12838,15 @@ std::vector<u64> BbscWatchTargets() {
         return out;
     }
     const u64 local = ReadValue<u64>(world_chr, 0x60);
+    // Down outside a boss fight, the camera stays at our own body (2026-10-24, the user: following
+    // the other hunter can go where the world is not loaded here). A boss arena is loaded, so a
+    // boss fight still watches the living hunters.
+    if (bbsc_spectate_active && bbsc_death_mode == BbscDeathMode::Downed) {
+        if (local != 0 && ReadCharacterTransform(local).has_value()) {
+            out.push_back(local);
+        }
+        return out;
+    }
     const s32 count = ReadValue<s32>(world_chr, 0x30);
     const u64 entries = ReadValue<u64>(world_chr, 0x38);
     if (count <= 0 || count > 64 || !ReadablePointer(entries, static_cast<size_t>(count) * 0x38)) {
@@ -11639,7 +12872,23 @@ std::vector<u64> BbscWatchTargets() {
 }
 
 // The co-op banner, at most every 1.5 s (switching fast would queue one banner per press).
+// The buttons by name: the banner drops the game's <img src="KG_..."> icons (KG_OK, KG_Cancel, ...
+// in menu/common.tpf) and draws nothing in their place (2026-10-24 tests), so it says them.
+constexpr std::string_view BbscIconR1 = "R1 (Tab)";
+constexpr std::string_view BbscIconTouchpad = "Touchpad (F)";
+
+// The death camera's notice waits until the game's YOU DIED is gone (2026-10-24, the user: it was
+// shown under it): BbscWatchNoticeDelayMs after the death step's last part.
+constexpr s64 BbscWatchNoticeDelayMs = 4'000;
+std::string bbsc_watch_pending;
+std::string bbsc_watch_pending_what;
+
 void BbscWatchNotice(std::string_view text, std::string_view what, s64 now) {
+    if (bbsc_spectate_active && now - bbsc_spectate_since_ms < BbscWatchNoticeDelayMs) {
+        bbsc_watch_pending = std::string{text};
+        bbsc_watch_pending_what = std::string{what};
+        return;
+    }
     if (now - bbsc_watch.notice_ms < 1'500) {
         return;
     }
@@ -11654,6 +12903,15 @@ void BbscWatchNotice(std::string_view text, std::string_view what, s64 now) {
 
 // Camera director update (game thread). True when this frame's camera was written here.
 bool BbscWatchCamera(u64 director, u64 render, const Bbsc::CinematicInput& in, s64 now) {
+    if (!bbsc_watch_pending.empty() &&
+        (!bbsc_spectate_active || now - bbsc_spectate_since_ms >= BbscWatchNoticeDelayMs)) {
+        const std::string text = std::move(bbsc_watch_pending);
+        const std::string what = std::move(bbsc_watch_pending_what);
+        bbsc_watch_pending.clear();
+        if (bbsc_spectate_active) {
+            BbscWatchNotice(text, what, now);
+        }
+    }
     const std::vector<u64> targets = BbscWatchTargets();
     if (targets.empty()) {
         if (bbsc_watch.on) {
@@ -11701,11 +12959,21 @@ bool BbscWatchCamera(u64 director, u64 render, const Bbsc::CinematicInput& in, s
         if (!bbsc_watch.told) {
             bbsc_watch.told = true;
             bbsc_watch.notice_ms = 0;
-            BbscWatchNotice(size > 1 ? fmt::format("Watching hunter {} of {}.\nTab / R1: next "
-                                                   "hunter.\nF: free camera.",
-                                                   index + 1, size)
-                                     : std::string{"Watching the living hunter.\nF: free camera."},
-                            "watch camera", now);
+            // A downed hunter outside a boss fight can go to the lamp: said here, with the button
+            // and the key (2026-10-24, the user: the game's YOU DIED is enough, and the notice
+            // named only keyboard keys).
+            const bool lamp_choice =
+                bbsc_spectate_active && bbsc_death_mode == BbscDeathMode::Downed;
+            const std::string free_cam = std::string{BbscIconTouchpad} + ": free camera.";
+            // Down outside a boss fight: the lamp and the free camera are both on the game's own
+            // prompt (TickBbscRevive, text 10010715), with their icons - no banner (2026-10-24,
+            // the user: "just the two buttons when dead").
+            if (!lamp_choice) {
+                BbscWatchNotice(size > 1 ? fmt::format("Watching hunter {} of {}. {}: next hunter.\n{}",
+                                                       index + 1, size, BbscIconR1, free_cam)
+                                         : "Watching the living hunter.\n" + free_cam,
+                                "watch camera", now);
+            }
         } else {
             BbscWatchNotice(fmt::format("Watching hunter {} of {}.", index + 1, size),
                             "watch camera switch", now);
@@ -11870,6 +13138,11 @@ void PS4_SYSV_ABI BbscCinematicCameraHook(u64 /*tag*/, const GuestRegisterSnapsh
     }
     // Dead in co-op: watch a living hunter (BbscWatchCamera); F flies freely instead, and back.
     if (bbsc_spectate_active) {
+        if (std::exchange(bbsc_free_camera_on_down, false) && !bbsc_watch.free) {
+            bbsc_watch.free = true;
+            bbsc_watch.on = false;
+            LOG_INFO(Debug, "BBSC watch camera: down - flying freely from the start");
+        }
         if (in.toggle_free) {
             bbsc_watch.free = !bbsc_watch.free;
             bbsc_watch.on = false;
@@ -13076,6 +14349,10 @@ std::string BbscBannerText() {
     return out;
 }
 
+constexpr s64 BbscFallenQuietMs = 8'000;
+extern s64 bbsc_death_script_ms; // see "Late death steps"
+bool BbscReviveEnabled(); // see "Reviving a fallen hunter"
+
 bool BbscJoinQuiet() {
     const s32 state = GetSessionState();
     if (state != 4 && state != 5 && state != 6) {
@@ -13094,14 +14371,21 @@ void PS4_SYSV_ABI BbscBannerMenuHook(u64 /*tag*/, const GuestRegisterSnapshot* r
     const std::string text = BbscBannerText();
     const bool own = bbsc_banner_own_pending;
     bbsc_banner_own_pending = false;
-    const bool hide = !own && BbscJoinQuiet();
+    // The game's own "You died." on a guest who now waits to be revived (2026-10-24, the user: no
+    // banner when you fall; BBSC no longer raises it, the game still shows it): the banners of the
+    // first BbscFallenQuietMs after our death step started are hidden.
+    const bool fallen_quiet = BbscReviveEnabled() && bbsc_death_script_ms != 0 &&
+                              SteadyNowMs() - bbsc_death_script_ms < BbscFallenQuietMs &&
+                              (GetSessionState() == 3 || GetSessionState() == 6);
+    const bool hide = !own && (BbscJoinQuiet() || fallen_quiet);
     if (hide) {
         WriteValue<u8>(image_base + BannerPendingOffset, 0, 0);
     }
     const s64 now = SteadyNowMs();
     if (text != last_text || now - last_ms > 2'000 || hide) {
         LOG_INFO(Debug, "BBSC banner: \"{}\" {} (session state {})", text,
-                 hide ? "hidden - guest joining" : (own ? "shown (BBSC's own)" : "shown"),
+                 hide ? (fallen_quiet ? "hidden - we just fell" : "hidden - guest joining")
+                      : (own ? "shown (BBSC's own)" : "shown"),
                  GetSessionState());
     }
     last_text = text;
@@ -13371,8 +14655,11 @@ void TickBbscDeadWatchdog() {
     }
     const u64 player = GetLocalPlayerCharacter();
     const s32 hp = ReadablePointer(player, 0x3B8) ? GetCharacterHp(player) : -1;
-    // A held death during a boss fight is meant to stay dead until the boss is over.
-    const bool spectating = bbsc_spectate_active && bbsc_death_mode == BbscDeathMode::Spectate;
+    // A held death during a boss fight is meant to stay dead until the boss is over, and a downed
+    // hunter until it is revived or chooses the lamp (2026-10-24: the watchdog revived a downed
+    // guest at the lamp 8 s after it fell).
+    const bool spectating = bbsc_spectate_active && (bbsc_death_mode == BbscDeathMode::Spectate ||
+                                                     bbsc_death_mode == BbscDeathMode::Downed);
     if (!session_alive || hp > 0 || hp < 0 || spectating || BbscCurtainActive()) {
         bbsc_dead_since_ms = 0;
         return;
@@ -13417,6 +14704,27 @@ void TickBbscDeadWatchdog() {
         BBSC_TIMELINE("DEATH", "death: repeat death in a boss fight (session state {}) -> spectate "
                         "until the boss dies or nobody is alive",
                  session_state);
+        return;
+    }
+    if (repeat && BbscReviveEnabled() && LivingPartnerExists()) {
+        // A repeat death outside a boss fight waits to be revived too, as the first one does.
+        bbsc_spectate_name = "repeat death";
+        bbsc_spectate_since_ms = now;
+        bbsc_spectate_chr = player;
+        bbsc_spectate_alone_since_ms = 0;
+        bbsc_spectate_logged_wait = false;
+        bbsc_spectate_saw_wipe = false;
+        bbsc_spectate_wipe_warped = false;
+        bbsc_spectate_host_back_ms = 0;
+        bbsc_spectate_revivals_at_death = bbsc_peer_revivals.load();
+        bbsc_boss_cleared_since_ms = 0;
+        bbsc_death_mode = BbscDeathMode::Downed;
+        bbsc_revive_received = false;
+        bbsc_spectate_active = true;
+        LOG_INFO(Debug, "BBSC death: repeat death (session state {}) -> down until revived, or the "
+                        "lamp on X",
+                 session_state);
+        BBSC_TIMELINE("DEATH", "death: repeat death -> down until revived, or the lamp on X");
         return;
     }
     if (repeat) {
@@ -16060,6 +17368,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         TickBbscEchoCounter();
         TickBbscSharedProgress();
         TickBbscSpectate();
+        TickBbscRevive();
         TickBbscFollowBroadcast();
         TickBbscWorldFlagsBroadcast();
         TickBbscFollowHost();
@@ -16104,6 +17413,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         if (BbscRejoinEnabled()) {
             TrackBbscSignType();
             TickBbscReinsertV8();
+            TickBbscHomeTypeRepair();
             TickBbscSelfHeal();
             static s64 last_shape_ms = 0;
             if (const s64 now = SteadyNowMs(); now - last_shape_ms > 1'000) {
@@ -16804,6 +18114,11 @@ void NoteBbscHostRangOurSign(std::uint32_t sender) {
 
 std::int32_t GetBbscRelaySessionState() {
     return bbsc_relay_session_state.load();
+}
+
+void OnBbscRevivePacket(std::uint8_t kind, std::uint32_t player, std::uint32_t target,
+                        std::uint32_t map, float x, float y, float z, std::uint8_t percent) {
+    BbscReviveRelayPacket(kind, player, target, map, x, y, z, percent);
 }
 
 void OnBbscLifePacket(std::uint32_t player, std::uint8_t dead, std::uint32_t sequence) {
@@ -17808,6 +19123,8 @@ void InstallReverseEngineeringTrace() {
     InstallBbscEchoPathHooks();
     InstallBbscDreamHooks();
     InstallBbscFloorGuardAndPickupTrace();
+    InstallBbscFadeGuard();
+    InstallBbscPromptCentring();
     InstallBbscCinematicHook();
     InstallBbscQuitHook();
     InstallBbscDeathTraceHooks();

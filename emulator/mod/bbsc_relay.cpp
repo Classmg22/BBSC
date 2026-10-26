@@ -57,6 +57,9 @@ constexpr u8 ScaleType = 0x24;  // "SHAD" 0x24 + 5 x u16 the host's scaling perc
 constexpr u8 PvpType = 0x25;    // "SHAD" 0x25 + u8 kind (0 host state, 1 guest asks) + u8 on + u32
 constexpr u8 ProgressType = 0x26; // "SHAD" 0x26 + u8 count + count x u32 the host's boss flags
 constexpr u8 HostBossType = 0x27; // "SHAD" 0x27 + s32 the boss on the host's boss bar (-1 none)
+// "SHAD" 0x2A + u8 kind + u32 sender + u32 target + u32 map + 3 x float + u8 percent: the co-op
+// revive (bloodborne_re.cpp, "Reviving a fallen hunter").
+constexpr u8 ReviveType = 0x2A;
 constexpr u8 PeersType = 0x7F; // server -> client: "N other players are connected", 1 byte count
 // Every frame since 2026-10-06: "SHAD" 0x40 + u32 sender + u32 session (the host's sender id, 0 = in
 // no session) + the packet above. The server sends each frame to everyone connected to it, so the
@@ -306,6 +309,18 @@ void Dispatch(const std::vector<u8>& wrapped) {
         std::memcpy(&player, frame.data() + 5, 4);
         std::memcpy(&sequence, frame.data() + 10, 4);
         Core::Bloodborne::OnBbscLifePacket(player, frame[9], sequence);
+    } else if (frame[4] == ReviveType && frame.size() >= 31) {
+        if (session == 0 || session != SessionKey()) {
+            return; // only the players of our own session
+        }
+        u32 player = 0, target = 0, map = 0;
+        float position[3]{};
+        std::memcpy(&player, frame.data() + 6, 4);
+        std::memcpy(&target, frame.data() + 10, 4);
+        std::memcpy(&map, frame.data() + 14, 4);
+        std::memcpy(position, frame.data() + 18, 12);
+        Core::Bloodborne::OnBbscRevivePacket(frame[5], player, target, map, position[0],
+                                             position[1], position[2], frame[30]);
     } else if (frame[4] == ScaleType && frame.size() >= 15) {
         if (from_our_host()) {
             std::uint16_t percent[5]{};

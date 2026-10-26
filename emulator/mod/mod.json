@@ -18,6 +18,7 @@
     {"id": "lamp", "name": "Lamps in co-op", "description": "The host can use lamps during a session", "type": "bool", "default": true, "env": "SHADPS4_BBSC_LAMP"},
     {"id": "host_dead", "name": "Stay when the host dies", "description": "The guest keeps the session if the host dies", "type": "bool", "default": true, "env": "SHADPS4_BBSC_PERSIST_HOSTDEAD"},
     {"id": "spectate", "name": "Respawn in place", "description": "A dead player respawns / spectates instead of leaving", "type": "bool", "default": true, "env": "SHADPS4_BBSC_SPECTATE"},
+    {"id": "revive", "name": "Revive", "description": "A fallen hunter waits where it fell; another one revives it by holding X beside it for 15 s", "type": "bool", "default": true, "env": "SHADPS4_BBSC_REVIVE"},
     {"id": "full_echoes", "name": "Full echoes", "description": "A guest is paid the host's rate, not half", "type": "bool", "default": true, "env": "SHADPS4_BBSC_FULL_ECHOES"},
     {"id": "no_hp_penalty", "name": "No guest HP cut", "description": "Removes the summoned guest's 30% max HP cut", "type": "bool", "default": true, "env": "SHADPS4_BBSC_NO_HP_PENALTY"},
     {"id": "guest_items", "name": "Guest items", "description": "A guest picks up and keeps items", "type": "bool", "default": true, "env": "SHADPS4_BBSC_GUEST_ITEMS"},

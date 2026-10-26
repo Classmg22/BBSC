@@ -12,6 +12,7 @@
 // and right stick reach it only then (CinematicPadRead - the F1 camera leaves the pad to the hunter).
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <mutex>
 
@@ -203,9 +204,17 @@ void CinematicSetWatching(bool on) {
     watching = on;
 }
 
+std::atomic<unsigned> cine_held_buttons{0};
+
+unsigned HeldPadButtons() {
+    return cine_held_buttons.load();
+}
+
 void CinematicPadRead(unsigned buttons, unsigned char rx, unsigned char ry, unsigned char lx,
                       unsigned char ly) {
-    (void)lx;
+    // The left stick moving as bit 0x40000000, for the revive (it stops on it).
+    const bool moving = std::hypot(PadAxis(lx), PadAxis(ly)) > 0.3f;
+    cine_held_buttons = buttons | (moving ? 0x40000000u : 0u);
     std::scoped_lock lock{cine_mutex};
     constexpr unsigned L1 = 0x400, R1 = 0x800;
     const unsigned pressed = buttons & ~pad_last;

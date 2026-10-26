@@ -23,16 +23,16 @@
 {30, 103400, u"You died."}, // You died. Returning to your world.
 {30, 103500, u"You died."}, // You died. Returning to your world.
 {30, 103101, u"The host died.\nYou stay in their game."}, // Your beckoner has died. Returning to own world.
-{30, 103001, u"<?deadName?> died.\nThey will respawn."}, // Cooperator <?deadName?> has died.
-{30, 103006, u"<?deadName?> died.\nThey will respawn."}, // Confederate <?deadName?> has died.
-{30, 103007, u"<?deadName?> died.\nThey will respawn."}, // Confederate <?deadName?> has died.
-{30, 103056, u"<?deadName?> died.\nThey will respawn."}, // Confederate <?deadName?> has died.
-{30, 103057, u"<?deadName?> died.\nThey will respawn."}, // Confederate <?deadName?> has died.
-{30, 103051, u"<?deadName?> died.\nThey will respawn."}, // Old Hunter <?deadName?> has died.
-{30, 103052, u"<?deadName?> died.\nThey will respawn."}, // Old Hunter <?deadName?> has died.
-{30, 103053, u"<?deadName?> died.\nThey will respawn."}, // Old Hunter <?deadName?> has died.
-{30, 103054, u"<?deadName?> died.\nThey will respawn."}, // Old Hunter <?deadName?> has died.
-{30, 103055, u"<?deadName?> died.\nThey will respawn."}, // Old Hunter <?deadName?> has died.
+{30, 103001, u"<?deadName?> has fallen."}, // Cooperator <?deadName?> has died.
+{30, 103006, u"<?deadName?> has fallen."}, // Confederate <?deadName?> has died.
+{30, 103007, u"<?deadName?> has fallen."}, // Confederate <?deadName?> has died.
+{30, 103056, u"<?deadName?> has fallen."}, // Confederate <?deadName?> has died.
+{30, 103057, u"<?deadName?> has fallen."}, // Confederate <?deadName?> has died.
+{30, 103051, u"<?deadName?> has fallen."}, // Old Hunter <?deadName?> has died.
+{30, 103052, u"<?deadName?> has fallen."}, // Old Hunter <?deadName?> has died.
+{30, 103053, u"<?deadName?> has fallen."}, // Old Hunter <?deadName?> has died.
+{30, 103054, u"<?deadName?> has fallen."}, // Old Hunter <?deadName?> has died.
+{30, 103055, u"<?deadName?> has fallen."}, // Old Hunter <?deadName?> has died.
 {30, 106200, u"The host <?hostName?> died.\nYou stay in their game."}, // Beckoner <?hostName?> has fallen. It is time to bid farewell.
 {30, 105200, u"The host started the battle against\n<?npcNameId@1000?>."}, // Battle with <?npcNameId@1000?> has commenced. Returning to your world.
 {30, 105300, u"The host started the battle against\n<?npcNameId@1000?>."}, // Battle with <?npcNameId@1000?> has commenced. Returning to your world.
@@ -191,6 +191,8 @@
 {30, 15000011, u"You caught up with <?hostName?>."}, // *
 {30, 15000012, u"<?joinName?> caught up with you."}, // *
 {30, 15000035, u"You are in the host's Hunter's Dream."}, // *
+{30, 10010104, u"Revive Hunter"}, // *
+{30, 10010715, u"Return to Lamp"}, // *
 {10, 4016, u"Hunt Bell"}, // (empty)
 {20, 4016, u"Ring to call other players into your game.\nCosts no Insight."}, // (empty)
 {24, 4016, u"An old bell carried by the hunters of the\nworkshop, its toll heard across every world.\n\nRing it, and hunters who answer with a\nKin Bell may join your hunt. Together you\nwalk the night, through every lamp,\ndeath and dream, until the hunt is done."}, // (empty)

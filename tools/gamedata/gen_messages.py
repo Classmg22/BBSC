@@ -55,11 +55,11 @@ for i in (102100, 102200, 102600, 102700):
 for i in (103100, 103200, 103300, 103400, 103500):
     replace(i, r'^You died\.\s*(\n)?Returning to your world\.$', 'You died.')
 replace(103101, r'^Your beckoner has died\.', 'The host died.\nYou stay in their game.')
-replace(103001, r'^Cooperator <\?deadName\?> has died\.$', '<?deadName?> died.\nThey will respawn.')
+replace(103001, r'^Cooperator <\?deadName\?> has died\.$', '<?deadName?> has fallen.')
 for i in (103006, 103007, 103056, 103057):
-    replace(i, r'^Confederate <\?deadName\?> has died\.$', '<?deadName?> died.\nThey will respawn.')
+    replace(i, r'^Confederate <\?deadName\?> has died\.$', '<?deadName?> has fallen.')
 for i in range(103051, 103056):
-    replace(i, r'^Old Hunter <\?deadName\?> has died\.$', '<?deadName?> died.\nThey will respawn.')
+    replace(i, r'^Old Hunter <\?deadName\?> has died\.$', '<?deadName?> has fallen.')
 replace(106200, r'^Beckoner <\?hostName\?> has fallen\.', 'The host <?hostName?> died.\nYou stay in their game.')
 
 # Boss battles. The battle lines keep the game's own boss-name tag. The two generic "final battle"
@@ -168,6 +168,13 @@ replace(1122, r'Small Resonant Bell', "Join another player's game\nwith the Kin 
 replace(15000011, r'^\*$', 'You caught up with <?hostName?>.')
 replace(15000012, r'^\*$', '<?joinName?> caught up with you.')
 replace(15000035, r'^\*$', "You are in the host's Hunter's Dream.")
+# The co-op revive's prompts (bloodborne_re.cpp, BbscShowButtonPrompt): the game's action button
+# shows them with the button's icon. Two more empty "*" slots, the first beside "Pick Up Item".
+replace(10010104, r'^\*$', 'Revive Hunter')
+# The fallen hunter's prompt. The prompt (menu/fe.gfx, ActionButton1) draws only its own button,
+# from a clip (Button_0), and none of the KG_ icon images: <img src="KG_TP_L"> drew nothing there
+# (19:21 test), so the free camera has no prompt and starts by itself.
+replace(10010715, r'^\*$', 'Return to Lamp')
 
 # The Duel Bell (PvP toggle, bloodborne_re.cpp "PvP toggle item"): goods 4313 is an unused key item
 # with empty slots in the item name / info / caption tables (msg/engus/item.msgbnd: 10, 20, 24).
