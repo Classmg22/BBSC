@@ -168,6 +168,9 @@ replace(1122, r'Small Resonant Bell', "Join another player's game\nwith the Kin 
 replace(15000011, r'^\*$', 'You caught up with <?hostName?>.')
 replace(15000012, r'^\*$', '<?joinName?> caught up with you.')
 replace(15000035, r'^\*$', "You are in the host's Hunter's Dream.")
+# The Communion Chalice's question before the drink (its goods row's yesNoDialogMessageId), an empty
+# "*" slot among the game's item prompts that nothing refers to.
+replace(10010854, r'^\*$', "Drink from the Communion Chalice\nand share progress with the other hunters?")
 
 # The Duel Bell (PvP toggle, bloodborne_re.cpp "PvP toggle item"): goods 4313 is an unused key item
 # with empty slots in the item name / info / caption tables (msg/engus/item.msgbnd: 10, 20, 24).
@@ -211,6 +214,13 @@ replace(200, r'.', 'No longer used. Use the Hunt Bell.', category=20)
 replace(205, r'.', 'No longer used. Use the Kin Bell.', category=20)
 replace(225, r'.', 'No longer used. Use the Bloodlust Bell.', category=20)
 replace(111, r'.', 'No longer used. Use the Parting Blank.', category=20)
+fill(201, 'Communion Chalice', 10)
+fill(201, "A cup of communion between hunters. Share\nkeys, weapons and runes in co-op; a guest\n"
+     "also carries the host's progress home.", 20)
+fill(201, "A chalice of the Healing Church, passed between\nhunters who walk the same night.\n\n"
+     "Those who drink partake of one another's blood,\nand of all it carries: keys, arms and runes.\n"
+     "A guest also carries home the host's lamps\nand the beasts the host has slain.\n\n"
+     "Your own strength remains your own.", 24)
 fill(4313, 'Duel Bell', 10)
 fill(4313, 'Ring in co-op to turn on PvP between players.\nRing again to turn it off.', 20)
 fill(4313, 'A cracked bell with a sour, discordant chime.\n\n'

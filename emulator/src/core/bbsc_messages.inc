@@ -191,6 +191,7 @@
 {30, 15000011, u"You caught up with <?hostName?>."}, // *
 {30, 15000012, u"<?joinName?> caught up with you."}, // *
 {30, 15000035, u"You are in the host's Hunter's Dream."}, // *
+{30, 10010854, u"Drink from the Communion Chalice\nand share progress with the other hunters?"}, // *
 {10, 4016, u"Hunt Bell"}, // (empty)
 {20, 4016, u"Ring to call other players into your game.\nCosts no Insight."}, // (empty)
 {24, 4016, u"An old bell carried by the hunters of the\nworkshop, its toll heard across every world.\n\nRing it, and hunters who answer with a\nKin Bell may join your hunt. Together you\nwalk the night, through every lamp,\ndeath and dream, until the hunt is done."}, // (empty)
@@ -207,6 +208,9 @@
 {20, 205, u"No longer used. Use the Kin Bell."}, // Ring this bell to help hunters in other worlds.
 {20, 225, u"No longer used. Use the Bloodlust Bell."}, // Ring to become the enemy of a hunter in another world.
 {20, 111, u"No longer used. Use the Parting Blank."}, // Fire to end ongoing, and prevent further, cooperation.
+{10, 201, u"Communion Chalice"}, // (empty)
+{20, 201, u"A cup of communion between hunters. Share\nkeys, weapons and runes in co-op; a guest\nalso carries the host's progress home."}, // (empty)
+{24, 201, u"A chalice of the Healing Church, passed between\nhunters who walk the same night.\n\nThose who drink partake of one another's blood,\nand of all it carries: keys, arms and runes.\nA guest also carries home the host's lamps\nand the beasts the host has slain.\n\nYour own strength remains your own."}, // (empty)
 {10, 4313, u"Duel Bell"}, // (empty)
 {20, 4313, u"Ring in co-op to turn on PvP between players.\nRing again to turn it off."}, // (empty)
 {24, 4313, u"A cracked bell with a sour, discordant chime.\n\nRing it while hunting together, and the\nresonance binding the hunters turns to\nrivalry: they may strike one another as foes.\n\nRing it again to restore the old bond.\nOnly the beckoner decides; a cooperator\nwho rings it merely asks."}, // (empty)

@@ -40,6 +40,7 @@ void OnBbscScalePacket(const std::uint16_t (&percent)[5]);
 // BBSC PvP (Duel Bell): kind 0 = the host's PvP state, kind 1 = a guest asks the host for `on`.
 // Relay receive thread; only stores it.
 void OnBbscPvpPacket(std::uint8_t kind, std::uint8_t on);
+void OnBbscCommunionPacket(std::uint8_t kind, const void* data, std::uint32_t size);
 // BBSC relay sessions (mod): a hosting player's follow packet (relay thread; only stored), the host
 // a guest takes packets from (0 = none known yet), and the session state as of the last game tick.
 // BBSC shared progress: the host's boss-defeat flags that are on (relay "SHAD" 0x26). Relay thread.
