@@ -15058,8 +15058,9 @@ bool BbscHasGear(u32 tagged) {
 // ---- Supplies (2026-10-25, the user: add the Blood Stones that fortify weapons, "same with Fire
 // Paper, Bolt Paper, etc") -------------------------------------------------------------------------
 // Every stackable consumable of EquipParamGoods (goodsType 0, maxNum above 1) and the four Blood
-// Stones (goodsType 2), read off the game's param with tools/gamedata/param.py. The other side's
-// whole count, carried and stored, is added (the user's choice: not topped up to it). Sent as
+// Stones (goodsType 2), read off the game's param with tools/gamedata/param.py. Synced, not added
+// (2026-10-26, the user: "we dont need to add items, just sync"): the receiver is topped up to the
+// other side's count, carried and stored together, and never loses any. Sent as
 // 0xC0000000 | id << 12 | count, both below 4096; an older peer drops it like any id that is not a
 // key item. What does not fit in the carried items goes to the storage box, through the same fit
 // check and add as the kit's items.
@@ -15088,8 +15089,9 @@ std::vector<u32> BbscHeldGoodsTagged() {
     return goods;
 }
 
-// Adds the supplies of a chalice's answer: into the carried items as far as they fit, the rest
-// into the storage box. Returns how many arrived in all.
+// Syncs the supplies of a chalice's answer: each one topped up to the highest count sent (several
+// guests answer a host's drink), into the carried items as far as they fit, the rest into the
+// storage box. Returns how many arrived in all.
 s32 GiveBbscCommunionGoods(const std::vector<u32>& tagged, std::string_view from) {
     const u64 carried = BbscCarriedInventory();
     const u64 storage = BbscStorageInventory();
@@ -15100,19 +15102,25 @@ s32 GiveBbscCommunionGoods(const std::vector<u32>& tagged, std::string_view from
     using Add = s32 PS4_SYSV_ABI (*)(u64 inventory, const u32* key, s32 count);
     alignas(16) static u32 code = 0;
     alignas(16) static u32 key = 0;
+    std::map<u32, s32> highest;
+    for (const u32 value : tagged) {
+        const u32 id = (value >> 12) & 0xFFF;
+        if ((value & 0xF0000000u) == BbscGearGoodsTag &&
+            std::ranges::find(BbscCommunionGoods, id) != BbscCommunionGoods.end()) {
+            highest[id] = std::max(highest[id], static_cast<s32>(value & 0xFFF));
+        }
+    }
     s32 total = 0;
     std::string summary;
-    for (const u32 value : tagged) {
-        if ((value & 0xF0000000u) != BbscGearGoodsTag) {
-            continue;
-        }
-        const u32 id = (value >> 12) & 0xFFF;
-        const s32 count = static_cast<s32>(value & 0xFFF);
-        if (count <= 0 || std::ranges::find(BbscCommunionGoods, id) == BbscCommunionGoods.end()) {
-            continue; // only the supplies, whatever the packet says
-        }
+    for (const auto& [id, theirs] : highest) {
         code = 0x40000000u | id;
         key = 0x80000000u | (3u << 28) | id;
+        const s32 ours = BbscInventoryCount(carried, code) +
+                         (storage != 0 ? BbscInventoryCount(storage, code) : 0);
+        const s32 count = theirs - ours;
+        if (count <= 0) {
+            continue; // we have as many already
+        }
         s32 arrived = 0;
         s32 stored = 0;
         for (const u64 inventory : {carried, storage}) {
@@ -15131,10 +15139,10 @@ s32 GiveBbscCommunionGoods(const std::vector<u32>& tagged, std::string_view from
             (inventory == carried ? arrived : stored) += added;
         }
         total += arrived + stored;
-        summary += fmt::format(" {} +{}/{} ({} carried, {} stored)", id, arrived + stored, count,
-                               arrived, stored);
+        summary += fmt::format(" {} {}->{} (+{} carried, +{} stored)", id, ours,
+                               ours + arrived + stored, arrived, stored);
     }
-    LOG_INFO(Debug, "BBSC communion bell: supplies from {} added, {} in all:{}", from, total,
+    LOG_INFO(Debug, "BBSC communion bell: supplies synced with {}, {} added in all:{}", from, total,
              summary);
     return total;
 }
